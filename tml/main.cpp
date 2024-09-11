@@ -1,13 +1,19 @@
 #include "tml.hpp"
 
+
+class idk : public std::string {
+public:
+};
+
 int main() {
-    tml::Process myproc("ls");
+
+    tml::Process myproc("dir");
 
     try {
         myproc
-          .args({"-l"})
-          .file_redirect("my_output.txt", false)
-          .working_directory("/Users/Diago/Desktop")
+          .args({"/a"})
+          .file_redirect("my_output.txt", true)
+          .working_directory("C:\\Users\\diago")
           .launch();
     } catch(const tml::TMLException& e) {
         std::cerr << "Exception: " << e.what() << std::endl;
