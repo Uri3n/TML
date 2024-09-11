@@ -1319,8 +1319,8 @@ inline
 tml::Process::~Process() {
     tml_defer([this] {
         handle_.close();
-        output_callback_worker_->join();
-        exit_callback_worker_->join();
+        if(output_callback_worker_) output_callback_worker_->join();
+        if(exit_callback_worker_)   exit_callback_worker_->join();
     });
 
     if(auto* pfile = std::get_if<OutputDevice>(&output_)) {
