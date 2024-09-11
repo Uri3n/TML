@@ -3,30 +3,65 @@
 #define TML_HPP
 
 #if defined(_WIN32)
-#define TML_WINDOWS
+    #define TML_WINDOWS
 #elif defined(__APPLE__) && defined(__MACH__)
-#define TML_MACOS
+    #define TML_MACOS
 #elif defined(__linux__)
-#define TML_LINUX
+    #define TML_LINUX
 #else
-#error "Unknown operating system - TML cannot be used on this platform."
+    #error "Unknown operating system - TML cannot be used on this platform."
+    #error "Supported platforms: Windows, MacOS, and Linux."
+#endif
+
+#if defined(__JETBRAINS_IDE__)
+    #define TML_VALUE_PARAM [[jetbrains::pass_by_value]]
+    #define TML_NEVER_USED  [[jetbrains::guard]]
+#else
+    #define TML_VALUE_PARAM
+    #define TML_NEVER_USED
 #endif
 
 #if defined(TML_WINDOWS)
-#include <Windows.h>
+    #include <Windows.h>
 #else // POSIX
-#include <unistd.h>
-#include <csignal>
-#include <sys/wait.h>
-#include <sys/types.h>
-#include <sys/mman.h>
-#include <fcntl.h>
+    #include <unistd.h>
+    #include <csignal>
+    #include <sys/wait.h>
+    #include <sys/types.h>
+    #include <sys/mman.h>
+    #include <fcntl.h>
+#endif
+
+#if defined(__clang__) || defined(__GNUC__)
+    #if defined(__clang__)
+        #define TML_COMPILEDWITH_CLANG
+    #else
+        #define TML_COMPILEDWITH_GCC
+    #endif
+    #if defined(__JETBRAINS_IDE__)
+        #define TML_ATTR_NOINLINE    inline __attribute__((noinline))
+        #define TML_ATTR_FORCEINLINE inline __attribute__((always_inline))
+    #else
+        #define TML_ATTR_NOINLINE    __attribute__((noinline))
+        #define TML_ATTR_FORCEINLINE __attribute__((always_inline))
+    #endif
+
+#elif defined(_MSC_VER_)
+    #define TML_COMPILEDWITH_MSVC
+    #define TML_ATTR_NOINLINE    __declspec(noinline)
+    #define TML_ATTR_FORCEINLINE __forceinline
+#else
+    #define TML_COMPILEDWITH_UNKNOWN
+    #define TML_ATTR_NOINLINE
+    #define TML_ATTR_FORCEINLINE
 #endif
 
 #include <iostream>
 #include <exception>
 #include <filesystem>
+#include <thread>
 #include <functional>
+#include <utility>
 #include <variant>
 #include <array>
 #include <chrono>
@@ -49,6 +84,12 @@ namespace tml {
     [[noreturn]] void _panic_impl(const std::string& file, int line, const std::string& msg = "");
 }
 
+namespace tml::this_process {
+    Handle get();
+    size_t get_id();
+    [[noreturn]] void kill(int status = 0);
+}
+
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // ~ tml::DeferredAction ~
@@ -67,10 +108,12 @@ class tml::DeferredAction {
 public:
     ~DeferredAction() { action_(); }
 
-    explicit DeferredAction(const decltype(action_)& action)
-        : action_(action) {}
-    explicit DeferredAction(const bool condition, const decltype(action_)& action)
-        : action_(action), condition_(condition), using_condition_(true) {}
+    explicit DeferredAction(decltype(action_)  action)
+        : action_(std::move(action)) {}
+    explicit DeferredAction(const bool condition, decltype(action_)  action)
+        : action_(std::move(action)),
+        condition_(condition),
+        using_condition_(true) {}
 };
 
 
@@ -115,6 +158,7 @@ public:
 #endif
 
     void close();
+    void invalidate();
     void kill()  const;
     [[nodiscard]] ExitCode get_exit_code()  const noexcept;
     [[nodiscard]] Value get() const noexcept;
@@ -150,8 +194,8 @@ struct tml::ExitCode {
         Unknown     // Unknown exit condition.
     };
 
-    const Value value;
-    const Type  type;
+    Value value;
+    Type  type;
 
     ~ExitCode() = default;
     ExitCode(const Value value, const Type type)
@@ -186,7 +230,7 @@ public:
     template<size_t out_size = 1024>
     void read_into(FlatBuffer<out_size>& out);
     void close();
-    Value value() const;
+    [[nodiscard]] Value value() const;
 
     static auto get_invalid_handle_state()                        -> Value;
     static auto is_invalid_handle_state(Value value)              -> bool;
@@ -253,6 +297,7 @@ private:
 };
 
 
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // ~ tml::Process ~
 // - class that represents a child process
@@ -264,40 +309,97 @@ private:
 
 class tml::Process {
 public:
-    using VariedOutputMethod = std::variant<OutputDevice::Pipe, OutputDevice, std::monostate>;
+    using AlignedBufferOutputCallback = std::function<void(const AlignedFlatBuffer&)>;
+    using DynamicBufferOutputCallback = std::function<void(const std::vector<uint8_t>&)>;
+    using OnExitCallback              = std::function<void(const ExitCode&)>;
+
+    ///////////////////////////////////////////////////////////////////////////////////////
+    // Public methods
 
     Process(const Process&)            = delete;
     Process& operator=(const Process&) = delete;
+    Process(Process&&) noexcept;
+    Process& operator=(Process&&) noexcept;
 
     Process& args(const std::vector<std::string>& arg_list);
     Process& args(std::vector<std::string>&& arg_list);
     Process& working_directory(const std::string& dir);
+    Process& file_redirect(const std::string& file_name, bool append_contents);
+    Process& on_exit(OnExitCallback callback);
     Process& launch();
 
-    void wait();
+    [[nodiscard]] ExitCode get_exit_code();
+    [[nodiscard]] bool exited();
+
+    template<typename Callback> requires
+        std::constructible_from<AlignedBufferOutputCallback, Callback> ||
+        std::constructible_from<DynamicBufferOutputCallback, Callback>
+    Process& buffer_redirect(size_t buff_size, Callback callback);
+
+    ExitCode wait();
     void wait_for(std::chrono::milliseconds time_ms);
 
-    Process& redirect_stdout(size_t buff_size, std::function<void(AlignedFlatBuffer&)>&& callback);
-    Process& redirect_stdout(size_t buff_size, std::function<void(std::vector<uint8_t>&)>&& callback);
-    Process& on_exit(std::function<void(const Process&)>&& callback);
+    ///////////////////////////////////////////////////////////////////////////////////////
+    // non-move constructor, destructor
 
     ~Process();
     explicit Process(std::string name)
     : handle_(Handle::get_invalid_handle_state()),
       name_(std::move(name)),
-      output_(std::monostate()) {}
+      callback_buffer_hint_(0),
+#if defined(TML_MACOS) || defined(TML_LINUX)
+      posix_cached_exit_code_(-1, ExitCode::Type::Unknown),
+#endif
+      output_(std::monostate()),
+      output_callback_(std::monostate()),
+      exit_callback_(std::monostate()){}
+
+    ///////////////////////////////////////////////////////////////////////////////////////
+    // Things we need to do post-launch
 
 private:
 #if defined(TML_MACOS) || defined(TML_LINUX)
     [[noreturn]] void _posix_child_launch_impl();
     void _posix_parent_launch_impl();
+    static ExitCode _posix_blocking_wait_impl(Handle child_handle);
 #endif
+
+    static void _launch_pipe_aligned_read_impl(OutputDevice::Value, AlignedBufferOutputCallback, size_t);
+    static void _launch_pipe_dyn_read_impl(OutputDevice::Value, DynamicBufferOutputCallback, size_t);
+    static void _launch_exit_wait_impl(Handle child_handle, OnExitCallback cb);
+
+    ///////////////////////////////////////////////////////////////////////////////////////
+    // Private members
 
     Handle handle_;
     std::string name_;
     std::string working_directory_;
-    VariedOutputMethod output_;
     std::vector<std::string> arguments_;
+    size_t callback_buffer_hint_;
+
+#if defined(TML_MACOS) || defined(TML_LINUX)
+    ExitCode posix_cached_exit_code_;
+#endif
+
+    std::unique_ptr<std::thread> output_callback_worker_ = nullptr;
+    std::unique_ptr<std::thread> exit_callback_worker_   = nullptr;
+
+    std::variant<
+        OutputDevice::Pipe,
+        OutputDevice,
+        std::monostate
+    > output_;
+
+    std::variant<
+        AlignedBufferOutputCallback,
+        DynamicBufferOutputCallback,
+        std::monostate
+    > output_callback_;
+
+    std::variant<
+        OnExitCallback,
+        std::monostate
+    > exit_callback_;
 };
 
 
@@ -318,6 +420,22 @@ tml::_panic_impl(const std::string& file, const int line, const std::string& msg
     if(!(condition))  tml::_panic_impl(__FILE__, __LINE__, std::string("Assertion failed: " #condition))
 
 #if defined(TML_WINDOWS)
+
+[[noreturn]] TML_ATTR_FORCEINLINE void
+tml::this_process::kill(const int status) {
+    ExitProcess((UINT)status);
+}
+
+TML_ATTR_FORCEINLINE size_t
+tml::this_process::get_id() {
+    return static_cast<size_t>(GetCurrentProcessId());
+}
+
+TML_ATTR_FORCEINLINE tml::Handle
+tml::this_process::get() {
+    return Handle(GetCurrentProcess());
+}
+
 std::string
 last_system_error() {
     DWORD err_code = GetLastError();
@@ -350,7 +468,23 @@ last_system_error() {
     return out;
 }
 
-#else // OS == UNIX
+#else // OS == POSIX
+
+[[noreturn]] TML_ATTR_FORCEINLINE void
+tml::this_process::kill(const int status) {
+    _exit(status); // NOT the same as C's exit()
+}
+
+TML_ATTR_FORCEINLINE size_t
+tml::this_process::get_id() {
+    return static_cast<size_t>(getpid());
+}
+
+TML_ATTR_FORCEINLINE tml::Handle
+tml::this_process::get() {
+    return Handle(getpid());
+}
+
 inline std::string
 tml::last_system_error() {
     char buffer[256]   = { 0 };
@@ -399,18 +533,24 @@ TML_EXCEPTION_TYPE_LIST
 // ~ Begin tml::Handle methods. ~
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-inline bool
+
+TML_ATTR_FORCEINLINE bool
 tml::Handle::is_invalid_handle_state(const Value value) {
     return value == get_invalid_handle_state();
 }
 
-inline bool
+TML_ATTR_FORCEINLINE void
+tml::Handle::invalidate() {
+    value_ = get_invalid_handle_state();
+}
+
+TML_ATTR_FORCEINLINE bool
 tml::Handle::is_invalid_handle_state(const Handle &handle) {
     return is_invalid_handle_state(handle.value_);
 }
 
-[[nodiscard]] inline tml::Handle::Value
-tml::Handle::get() const noexcept{
+[[nodiscard]] TML_ATTR_FORCEINLINE tml::Handle::Value
+tml::Handle::get() const noexcept {
     return value_;
 }
 
@@ -462,7 +602,7 @@ tml::Handle::get_invalid_handle_state() {
 
 inline void
 tml::Handle::kill() const {
-    if(value_ == get_invalid_handle_state()) {
+    if(is_invalid_handle_state(value_)) {
         return;
     }
     if(::kill(value_, SIGTERM) == -1) {
@@ -475,11 +615,11 @@ tml::Handle::get_exit_code() const noexcept {
     int status         = 0;
     const pid_t result = ::waitpid(value_, &status, WNOHANG);
 
-    if(result == -1) {
-        throw TMLException(last_system_error(), TMLException::Type::None);
+    if(result < 0) {
+        return { -1, ExitCode::Type::Unknown };  // an error has occurred.
     }
     if(result == 0) {
-        return { 0, ExitCode::Type::NotExited };
+        return { 0, ExitCode::Type::NotExited }; // The process is still running.
     }
 
     if(result == value_) {
@@ -522,7 +662,7 @@ tml::OutputDevice::create(const Value val, const Type type) {
     return device;
 }
 
-inline tml::OutputDevice::Value
+[[nodiscard]] inline tml::OutputDevice::Value
 tml::OutputDevice::value() const {
     return value_;
 }
@@ -568,7 +708,7 @@ tml::OutputDevice::create_file(const std::string& name, const bool append) {
         nullptr,                             // Security attributes for a descriptor. Optional.
         OPEN_ALWAYS,                         // Open mode.
         FILE_ATTRIBUTE_NORMAL,               // File attributes. File is normal.
-        nullptr                              // Optional file handle to a template file.
+        nullptr                              // Optional handle to a template file.
     );
 
     if(device.value_ == INVALID_HANDLE_VALUE) {
@@ -653,22 +793,23 @@ tml::OutputDevice::create_pipe() {
 }
 
 template<size_t out_size>
-auto tml::OutputDevice::read() -> std::array<uint8_t, out_size> {
+auto tml::OutputDevice::read() -> FlatBuffer<out_size> {
     std::array<uint8_t, out_size> out;
     std::fill(out.begin(), out.end(), '\0');
-
     if(::read(value_, out.data(), out.size()) == -1) {
         throw TMLException::OutputDeviceReadException();
     }
+
     return out;
 }
 
 template<size_t out_size>
-auto tml::OutputDevice::read_into(std::array<uint8_t, out_size>& out) -> void {
+auto tml::OutputDevice::read_into(FlatBuffer<out_size>& out) -> void {
     if(::read(value_, out.data(), out.size()) == -1) {
         throw TMLException::OutputDeviceReadException();
     }
 }
+
 #endif // #if defined(TML_WINDOWS)
 
 
@@ -699,12 +840,12 @@ tml::AlignedFlatBuffer::operator=(AlignedFlatBuffer&& other) noexcept {
     return *this;
 }
 
-[[nodiscard]] inline void*
+[[nodiscard]] TML_ATTR_FORCEINLINE void*
 tml::AlignedFlatBuffer::data() const {
     return buffer_;
 }
 
-[[nodiscard]] inline size_t
+[[nodiscard]] TML_ATTR_FORCEINLINE size_t
 tml::AlignedFlatBuffer::size() const {
     return size_;
 }
@@ -771,7 +912,7 @@ tml::AlignedFlatBuffer::destroy() noexcept {
     size_   = 0;
 }
 
-#endif
+#endif // #if defined(TML_WINDOWS)
 
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -779,22 +920,94 @@ tml::AlignedFlatBuffer::destroy() noexcept {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 inline tml::Process&
+tml::Process::operator=(Process&& other) noexcept {
+#if defined(TML_WINDOWS)
+    handle_.kill();
+    handle_.close();
+#else
+    handle_.close();
+#endif
+
+    if(exit_callback_worker_)   exit_callback_worker_->join();
+    if(output_callback_worker_) output_callback_worker_->join();
+
+    this->handle_                 = other.handle_;
+    this->callback_buffer_hint_   = other.callback_buffer_hint_;
+    this->output_                 = other.output_;
+    this->exit_callback_worker_   = std::move(other.exit_callback_worker_);
+    this->output_callback_worker_ = std::move(other.output_callback_worker_);
+    this->name_                   = std::move(other.name_);
+    this->working_directory_      = std::move(other.working_directory_);
+    this->arguments_              = std::move(other.arguments_);
+    this->exit_callback_          = std::move(other.exit_callback_);
+    this->output_callback_        = std::move(other.output_callback_);
+
+#if defined(TML_MACOS) || defined(TML_LINUX)
+    this->posix_cached_exit_code_ = other.posix_cached_exit_code_;
+#endif
+
+    other.output_          = std::monostate();
+    other.exit_callback_   = std::monostate();
+    other.output_callback_ = std::monostate();
+    other.handle_.invalidate();
+
+    return *this;
+}
+
+inline
+tml::Process::Process(Process&& other) noexcept
+    : handle_(other.handle_),
+     name_(std::move(other.name_)),
+     working_directory_(std::move(other.working_directory_)),
+     arguments_(std::move(other.arguments_)),
+     callback_buffer_hint_(other.callback_buffer_hint_),
+#if defined(TML_LINUX) || defined(TML_MACOS)
+    posix_cached_exit_code_(other.posix_cached_exit_code_),
+#endif
+     output_callback_worker_(std::move(other.output_callback_worker_)),
+     exit_callback_worker_(std::move(other.exit_callback_worker_)),
+     output_(other.output_),
+     output_callback_(std::move(other.output_callback_)),
+     exit_callback_(std::move(other.exit_callback_))
+{
+    other.output_          = std::monostate();
+    other.exit_callback_   = std::monostate();
+    other.output_callback_ = std::monostate();
+    other.handle_.invalidate();
+}
+
+TML_ATTR_FORCEINLINE tml::Process&
 tml::Process::args(const std::vector<std::string>& arg_list) {
     arguments_ = arg_list;
     return *this;
 }
 
-inline tml::Process&
+TML_ATTR_FORCEINLINE tml::Process&
 tml::Process::args(std::vector<std::string>&& arg_list) {
     arguments_ = arg_list;
     return *this;
 }
 
+[[nodiscard]] inline tml::ExitCode
+tml::Process::get_exit_code() {
+    if(posix_cached_exit_code_.type != ExitCode::Type::Unknown) {
+        return posix_cached_exit_code_;
+    }
+
+    const auto code = handle_.get_exit_code();
+    if(posix_cached_exit_code_.type == ExitCode::Type::Unknown
+        && code.type != ExitCode::Type::NotExited
+    ) {
+        posix_cached_exit_code_ = code;
+    }
+
+    return code;
+}
+
 inline tml::Process&
 tml::Process::working_directory(const std::string &dir) {
     namespace fs = std::filesystem;
-    const std::string err_msg
-        = "Specified working directory \"" + dir + "\" ";
+    const std::string err_msg = "Specified working directory \"" + dir + "\" ";
 
     if(!fs::exists(dir)) {
         throw TMLException(err_msg + "does not exist.", TMLException::Type::FileSystemException);
@@ -807,7 +1020,45 @@ tml::Process::working_directory(const std::string &dir) {
     return *this;
 }
 
+template<typename Callback> requires
+    std::constructible_from<tml::Process::AlignedBufferOutputCallback, Callback> ||
+    std::constructible_from<tml::Process::DynamicBufferOutputCallback, Callback>
+auto tml::Process::buffer_redirect(const size_t buff_size, Callback callback) -> Process& {
+    if(    !std::holds_alternative<std::monostate>(output_)
+        || !std::holds_alternative<std::monostate>(output_callback_)) {
+        return *this;
+    }
+
+    callback_buffer_hint_ = buff_size;
+    output_callback_      = callback;
+    output_               = OutputDevice::create_pipe();
+    return *this;
+}
+
+TML_ATTR_FORCEINLINE tml::Process&
+tml::Process::file_redirect(const std::string& file_name, const bool append_contents) {
+    if(    !std::holds_alternative<std::monostate>(output_)
+        || !std::holds_alternative<std::monostate>(output_callback_)) {
+        return *this;
+    }
+
+    output_ = OutputDevice::create_file(file_name, append_contents);
+    return *this;
+}
+
+TML_ATTR_FORCEINLINE tml::Process&
+tml::Process::on_exit(OnExitCallback callback) {
+    if(!std::holds_alternative<std::monostate>(exit_callback_)) {
+        return *this;
+    }
+
+    exit_callback_ = callback;
+    return *this;
+}
+
+
 #if defined(TML_WINDOWS)
+// TODO: launch, exit wait and output impl
 
 inline
 tml::Process::~Process() {
@@ -827,7 +1078,6 @@ tml::Process::_posix_child_launch_impl() {
     auto* file_ptr    = std::get_if<OutputDevice>(&output_);
     auto  hredirect   = OutputDevice::get_invalid_handle_state();
     std::vector argv  = { const_cast<char*>(name_.c_str()) };
-
 
     if(pipe_ptr != nullptr) {                         // If we need to redirect output into a pipe:
         pipe_ptr->read_end.close();                   // Close the read end of the pipe.
@@ -851,7 +1101,7 @@ tml::Process::_posix_child_launch_impl() {
 
     argv.emplace_back(nullptr);                       // POSIX argv array must end in a null pointer.
     if(!working_directory_.empty()) {                 // Set working directory of the child.
-        chdir(working_directory_.c_str());            // Not worth error checking this.
+        chdir(working_directory_.c_str());            // Not worth error checking this frankly.
     }
 
     execvp(name_.c_str(), argv.data());               // Replace child process' image.
@@ -860,31 +1110,180 @@ tml::Process::_posix_child_launch_impl() {
 
 inline void
 tml::Process::_posix_parent_launch_impl() {
-    // TODO: finish
+    auto*       ppipe       = std::get_if<OutputDevice::Pipe>(&output_);
+    const auto* pdyncb      = std::get_if<DynamicBufferOutputCallback>(&output_callback_);
+    const auto* palignedcb  = std::get_if<AlignedBufferOutputCallback>(&output_callback_);
+    const auto* pexitcb     = std::get_if<OnExitCallback>(&exit_callback_);
+
+    //
+    // If there's an exit callback, set up a worker thread.
+    //
+
+    if(pexitcb != nullptr) {
+        exit_callback_worker_ = std::make_unique<std::thread>(
+            _launch_exit_wait_impl,
+            handle_,
+            *pexitcb
+        );
+    }
+
+    if(ppipe == nullptr) {
+        return;
+    }
+
+    //
+    // If there is a pipe, set up callbacks for it.
+    // Also make sure to close the write end of the pipe.
+    //
+
+    ppipe->write_end.close();
+    if(pdyncb != nullptr) {
+        output_callback_worker_ = std::make_unique<std::thread> (
+            _launch_pipe_dyn_read_impl,
+            ppipe->read_end.value(),
+            *pdyncb,
+            callback_buffer_hint_
+        );
+    }
+
+    else if(palignedcb != nullptr) {
+        output_callback_worker_ = std::make_unique<std::thread>(
+            _launch_pipe_aligned_read_impl,
+            ppipe->read_end.value(),
+            *palignedcb,
+            callback_buffer_hint_
+        );
+    }
+
+    else {
+        tml_panic("Launched process has a pipe, but no output callback.");
+    }
+}
+
+inline tml::ExitCode
+tml::Process::_posix_blocking_wait_impl(TML_VALUE_PARAM const Handle child_handle) {
+    int status = 0;
+    const auto pid = ::waitpid(child_handle.get(), &status, 0);
+
+    // Once waiting is complete get the exit code.
+    if(pid < 0) {
+        return {-1, ExitCode::Type::Unknown};
+    }
+    if(pid == 0) {
+        return {0, ExitCode::Type::NotExited};
+    }
+
+    if(pid == child_handle.get()) {
+        if(WIFEXITED(status)) {
+            return {WEXITSTATUS(status), ExitCode::Type::Normal};
+        }
+        if(WIFSIGNALED(status)) {
+            return {WTERMSIG(status), ExitCode::Type::FromSignal};
+        }
+        if(WIFSTOPPED(status)) {
+            return {WSTOPSIG(status), ExitCode::Type::FromSignal};
+        }
+        return {-1, ExitCode::Type::Unknown };
+    }
+
+    tml_unreachable;
+}
+
+inline void
+tml::Process::_launch_exit_wait_impl(
+    TML_VALUE_PARAM const Handle child_handle,
+    TML_VALUE_PARAM OnExitCallback cb
+) {
+    const auto code = _posix_blocking_wait_impl(child_handle);
+    cb(code);
+}
+
+inline void
+tml::Process::_launch_pipe_aligned_read_impl(
+    TML_VALUE_PARAM const OutputDevice::Value pipe_end,
+    TML_VALUE_PARAM AlignedBufferOutputCallback cb,
+    size_t buffer_length
+) {
+    if(buffer_length == 0) {
+        buffer_length = 200;
+    }
+
+    const AlignedFlatBuffer buffer(buffer_length);
+    while(::read(pipe_end, buffer.data(), buffer.size()) > 0) {
+        cb(buffer);
+    }
+}
+
+inline void
+tml::Process::_launch_pipe_dyn_read_impl(
+    TML_VALUE_PARAM const OutputDevice::Value pipe_end,
+    TML_VALUE_PARAM DynamicBufferOutputCallback cb,
+    size_t buffer_length
+) {
+    if(buffer_length == 0) {
+        buffer_length = 200;
+    }
+
+    std::vector<uint8_t> buffer(buffer_length);
+    while(::read(pipe_end, buffer.data(), buffer.size())) {
+        cb(buffer);
+    }
+}
+
+inline bool
+tml::Process::exited() {
+    if(posix_cached_exit_code_.type != ExitCode::Type::Unknown) {
+        return true;
+    }
+
+    const auto code = handle_.get_exit_code();
+    if(posix_cached_exit_code_.type == ExitCode::Type::Unknown
+        && code.type != ExitCode::Type::NotExited
+    ) {
+        posix_cached_exit_code_ = code;
+    }
+
+    return code.type != ExitCode::Type::NotExited;
+}
+
+inline tml::ExitCode
+tml::Process::wait() {
+    if(posix_cached_exit_code_.type == ExitCode::Type::Unknown) {
+        posix_cached_exit_code_ = _posix_blocking_wait_impl(handle_);
+    }
+    return posix_cached_exit_code_;
 }
 
 inline tml::Process&
 tml::Process::launch() {
     const auto pid = fork();                          // Call fork() to spawn a child.
-    switch(pid) {
-        case -1: throw TMLException::ProcessLaunchException();
-        case  0: _posix_child_launch_impl();
-        default: break;
+    if(pid < 0) {                                     // < 0 indicates failure.
+        throw TMLException::ProcessLaunchException();
+    }
+    if(pid == 0) {                                    // We're inside the child (that sounds so wrong but idk).
+        _posix_child_launch_impl();                   // Redirect stdout, call chdir, etc.
     }
 
-    _posix_parent_launch_impl();
-    return *this;
+    handle_ = Handle(pid);
+    _posix_parent_launch_impl();                      // Set up callback threads.
+    return *this;                                     // Return class instance
 }
 
 inline
 tml::Process::~Process() {
-    if(Handle::is_invalid_handle_state(handle_)
-        || handle_.get_exit_code().type != ExitCode::Type::NotExited) {
+    tml_defer([this] {
+        if(output_callback_worker_) output_callback_worker_->join();
+        if(exit_callback_worker_)   exit_callback_worker_->join();
+    });
+
+    // ReSharper disable once CppTooWideScopeInitStatement
+    const auto child_exit = handle_.get_exit_code().type;
+    if(Handle::is_invalid_handle_state(handle_) || child_exit != ExitCode::Type::NotExited) {
         return;
     }
+
     handle_.close();
 }
 
 #endif // #if defined(TML_WINDOWS)
-
 #endif //TML_HPP
