@@ -1,28 +1,25 @@
 #include "tml.hpp"
 
+int foo();
 
-class idk : public std::string {
-public:
-};
-
+using namespace tml;
 int main() {
 
-    tml::Process myproc("dir");
-
-    try {
-        myproc
-          .args({"/a"})
-          .file_redirect("my_output.txt", true)
-          .working_directory("C:\\Users\\diago")
-          .launch();
-    } catch(const tml::TMLException& e) {
-        std::cerr << "Exception: " << e.what() << std::endl;
+    auto pipe = NamedPipe::create(ns("MyPipe"));
+    if(!pipe.is_open()) {
+        std::cerr << "failed to open pipe: " << last_system_error() << std::endl;
         return 1;
     }
 
-    const auto res = myproc.wait();
-    std::cout << "exit code: " << res.value << '\n';
-    std::cout << "exit type: " << (int)res.type << '\n';
+    std::cout << "Beginning read...\n";
+    pipe.on_receive([](const std::vector<uint8_t>& buffer) {
+        std::cout << "Received message from the pipe:\n";
+        std::cout.write((const char*)buffer.data(), buffer.size());
+        std::cout.flush();
+    });
 
+    sleep(2);
+    std::cout << "calling destroy\n";
+    pipe.destroy();
     return 0;
 }

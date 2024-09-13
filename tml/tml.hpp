@@ -23,15 +23,17 @@
 
 #if defined(TML_WINDOWS)
     #include <Windows.h>
-    #define ns L
+    #define ns(STR) (STR##L)
 #else // POSIX
     #include <unistd.h>
     #include <csignal>
     #include <sys/wait.h>
     #include <sys/types.h>
     #include <sys/mman.h>
+    #include <sys/stat.h>
     #include <fcntl.h>
-    #define ns (const char*)u8
+    #include <poll.h>
+    #define ns(STR) ((const char*)u8##STR)
 #endif
 
 #if defined(__clang__) || defined(__GNUC__)
@@ -71,6 +73,8 @@ namespace tml {
     class Handle;
     class TMLException;
     class DeferredAction;
+    class NamedPipe;
+    class SharedRegion;
     class AlignedFlatBuffer;
     struct ExitCode;
 }
@@ -87,6 +91,14 @@ namespace tml {
 
     template<size_t len>
     using FlatBuffer = std::array<uint8_t, len>;
+    using AlignedBufferCallback = std::function<void(const AlignedFlatBuffer&)>;
+    using DynamicBufferCallback = std::function<void(const std::vector<uint8_t>&)>;
+    using OnExitCallback        = std::function<void(const ExitCode&)>;
+
+    template<typename T>
+    concept BufferCallback =
+        std::constructible_from<AlignedBufferCallback, T> ||
+        std::constructible_from<DynamicBufferCallback, T>;
 }
 
 // Utility
@@ -231,11 +243,12 @@ public:
     using Value = int;
 #endif
 
-    struct Pipe;
+    struct AnonymousPipe;
     enum class Type : uint8_t {
-        None,    // Invalid
-        File,    // Output device is a file on disk.
-        PipeEnd, // Pipe, read or write end not specified.
+        None,       // Invalid
+        File,       // Output device is a file on disk.
+        PipeEnd,    // anonymous pipe. read or write end not specified.
+        NamedPipe,  // bidirectional named pipe.
     };
 
     template<size_t out_size = 1024> FlatBuffer<out_size> read();
@@ -249,7 +262,8 @@ public:
     static auto is_invalid_handle_state(Value value)               -> bool;
     static auto create(Value val, Type type)                       -> OutputDevice;
     static auto create_file(const NativeString& name, bool append) -> OutputDevice;
-    static auto create_pipe()                                      -> Pipe;
+    static auto create_named_pipe()                                -> OutputDevice;
+    static auto create_pipe()                                      -> AnonymousPipe;
 
     ~OutputDevice() = default;
     OutputDevice() : value_(get_invalid_handle_state()) {}
@@ -260,11 +274,56 @@ private:
     Type  type_ = Type::None;
 };
 
-struct tml::OutputDevice::Pipe {
+struct tml::OutputDevice::AnonymousPipe {
     OutputDevice read_end;
     OutputDevice write_end;
-    ~Pipe() = default;
-    Pipe()  = default;
+    ~AnonymousPipe() = default;
+    AnonymousPipe()  = default;
+};
+
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// ~ tml::NamedPipe ~
+// - represents an IPC mechanism for sending messages between processes.
+//
+
+class tml::NamedPipe {
+public:
+
+    template<size_t len = 1024>
+    std::pair<bool, size_t> receive(FlatBuffer<len>& buff)       const noexcept;
+    std::pair<bool, size_t> receive(void* buff, size_t len)      const noexcept;
+    std::pair<bool, size_t> receive(std::vector<uint8_t>& buff)  const noexcept;
+    std::pair<bool, size_t> receive(NativeString& buff, size_t len = 0) const noexcept;
+
+    template<size_t len = 1024>
+    std::pair<bool, size_t> send(FlatBuffer<len>& buff)         const noexcept;
+    std::pair<bool, size_t> send(const void* buff, size_t len)  const noexcept;
+    std::pair<bool, size_t> send(std::vector<uint8_t>& buff)    const noexcept;
+    std::pair<bool, size_t> send(const NativeString& buff)      const noexcept;
+
+    void on_receive(AlignedBufferCallback cb, size_t buff_len = 1024) const;
+    void on_receive(DynamicBufferCallback cb, size_t buff_len = 1024) const;
+
+    void close();
+    void invalidate();
+    bool destroy();
+    [[nodiscard]] bool is_open() const;
+
+    static NamedPipe create(const NativeString& name)  noexcept;
+    static NamedPipe connect(const NativeString& name) noexcept;
+
+    ~NamedPipe() = default;
+private:
+    static void _on_receive_aligned_impl(AlignedBufferCallback cb, OutputDevice::Value value, size_t buff_len = 1024);
+    static void _on_receive_dyn_impl(DynamicBufferCallback cb, OutputDevice::Value value, size_t buff_len = 1024);
+
+    OutputDevice handle_;
+#if defined(TML_MACOS) || defined(TML_LINUX)
+    NativeString name_; // because we can't delete a file with only an fd.
+#endif
+
+    NamedPipe() = default;
 };
 
 
@@ -324,10 +383,6 @@ private:
 
 class tml::Process {
 public:
-    using AlignedBufferOutputCallback = std::function<void(const AlignedFlatBuffer&)>;
-    using DynamicBufferOutputCallback = std::function<void(const std::vector<uint8_t>&)>;
-    using OnExitCallback              = std::function<void(const ExitCode&)>;
-
     ///////////////////////////////////////////////////////////////////////////////////////
     // Public methods
 
@@ -352,10 +407,8 @@ public:
     [[nodiscard]] ExitCode get_exit_code();
     [[nodiscard]] bool exited();
 
-    template<typename Callback> requires
-        std::constructible_from<AlignedBufferOutputCallback, Callback> ||
-        std::constructible_from<DynamicBufferOutputCallback, Callback>
-    Process& buffer_redirect(size_t buff_size, Callback callback);
+    template<typename T> requires tml::BufferCallback<T>
+    Process& buffer_redirect(size_t buff_size, T callback);
 
     ///////////////////////////////////////////////////////////////////////////////////////
     // non-move constructor, destructor
@@ -382,8 +435,8 @@ private:
     static ExitCode _posix_blocking_wait_impl(Handle child_handle);
 #endif
 
-    static void _launch_pipe_aligned_read_impl(OutputDevice::Value, AlignedBufferOutputCallback, size_t);
-    static void _launch_pipe_dyn_read_impl(OutputDevice::Value, DynamicBufferOutputCallback, size_t);
+    static void _launch_pipe_aligned_read_impl(OutputDevice::Value, AlignedBufferCallback, size_t);
+    static void _launch_pipe_dyn_read_impl(OutputDevice::Value, DynamicBufferCallback, size_t);
     static void _launch_exit_wait_impl(Handle child_handle, OnExitCallback cb);
 
     ///////////////////////////////////////////////////////////////////////////////////////
@@ -403,14 +456,14 @@ private:
     std::unique_ptr<std::thread> exit_callback_worker_   = nullptr;
 
     std::variant<
-        OutputDevice::Pipe,
+        OutputDevice::AnonymousPipe,
         OutputDevice,
         std::monostate
     > output_;
 
     std::variant<
-        AlignedBufferOutputCallback,
-        DynamicBufferOutputCallback,
+        AlignedBufferCallback,
+        DynamicBufferCallback,
         std::monostate
     > output_callback_;
 
@@ -568,9 +621,333 @@ TML_EXCEPTION_TYPE_LIST
 
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-// ~ Begin tml::Handle methods. ~
+// ~ Begin tml::NamedPipe methods. ~
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+TML_ATTR_FORCEINLINE bool
+tml::NamedPipe::is_open() const {
+    return !Handle::is_invalid_handle_state(handle_.value());
+}
+
+TML_ATTR_FORCEINLINE void
+tml::NamedPipe::close() {
+    handle_.close();
+}
+
+TML_ATTR_FORCEINLINE void
+tml::NamedPipe::invalidate() {
+    handle_.invalidate();
+}
+
+#if defined (TML_WINDOWS)
+
+#else // OS == POSIX
+
+inline tml::NamedPipe
+tml::NamedPipe::create(const NativeString &name) noexcept{
+    const auto full = NativeString("/tmp/TML_NAMED_PIPE_") + name;
+    NamedPipe pipe;
+
+    if(::mkfifo(full.c_str(), 0666) == -1) {
+        return pipe;
+    }
+
+    pipe.handle_ = OutputDevice(::open(full.c_str(), O_RDWR));
+    pipe.name_   = full;
+    return pipe;
+}
+
+inline tml::NamedPipe
+tml::NamedPipe::connect(const NativeString &name) noexcept {
+    const auto  full      = NativeString("/tmp/TML_NAMED_PIPE_") + name;
+    struct stat file_info = { 0 };
+    NamedPipe pipe;
+
+    if(::stat(full.c_str(), &file_info) == -1) {
+        return pipe;
+    }
+
+    if(!(S_ISFIFO(file_info.st_mode))) {
+        errno = EINVAL;
+        return pipe;
+    }
+
+    pipe.handle_ = OutputDevice(::open(full.c_str(), O_RDWR));
+    pipe.name_   = full;
+    return pipe;
+}
+
+inline std::pair<bool, size_t>
+tml::NamedPipe::receive(std::vector<uint8_t>& buff) const noexcept {
+    if(buff.empty() || !is_open()) {
+        return std::make_pair(false, 0);
+    }
+
+    pollfd fds[1] = { 0 };
+    fds[0].fd     = handle_.value();
+    fds[0].events = POLLIN;
+
+    if(::poll(fds, 1, -1) == -1 || !(fds[0].revents & POLLIN)) {
+        return std::make_pair(false, 0);
+    }
+
+    const auto result = ::read(handle_.value(), buff.data(), buff.size());
+    return result == -1
+      ? std::make_pair(false, static_cast<size_t>(0))
+      : std::make_pair(true,  static_cast<size_t>(result));
+}
+
+inline std::pair<bool, size_t>
+tml::NamedPipe::receive(void* const buff, const size_t len) const noexcept {
+    if(len == 0 || !is_open() || buff == nullptr) {
+        return std::make_pair(false, 0);
+    }
+
+    pollfd fds[1] = { 0 };
+    fds[0].fd     = handle_.value();
+    fds[0].events = POLLIN;
+
+    if(::poll(fds, 1, -1) == -1 || !(fds[0].revents & POLLIN)) {
+        return std::make_pair(false, 0);
+    }
+
+    const auto result = ::read(handle_.value(), buff, len);
+    return result == -1
+      ? std::make_pair(false, static_cast<size_t>(0))
+      : std::make_pair(true,  static_cast<size_t>(result));
+}
+
+template<size_t len>
+auto tml::NamedPipe::receive(FlatBuffer<len>& buff) const noexcept -> std::pair<bool, size_t> {
+    if(len == 0 || !is_open()) {
+        return std::make_pair(false, 0);
+    }
+
+    pollfd fds[1] = { 0 };
+    fds[0].fd     = handle_.value();
+    fds[0].events = POLLIN;
+
+    if(::poll(fds, 1, -1) == -1 || !(fds[0].revents & POLLIN)) {
+        return std::make_pair(false, 0);
+    }
+
+    const auto result = ::read(handle_.value(), buff.data(), buff.size());
+    return result == -1
+      ? std::make_pair(false, static_cast<size_t>(0))
+      : std::make_pair(true, static_cast<size_t>(result));
+}
+
+inline std::pair<bool, size_t>
+tml::NamedPipe::receive(NativeString& buff, const size_t len) const noexcept {
+    if(len != 0) {
+        buff.resize(len);
+    }
+    if(!is_open() || buff.empty()) {
+        return std::make_pair(false, 0);
+    }
+
+    pollfd fds[1] = { 0 };
+    fds[0].fd     = handle_.value();
+    fds[0].events = POLLIN;
+
+    if(::poll(fds, 1, -1) == -1 || !(fds[0].revents & POLLIN)) {
+        return std::make_pair(false, 0);
+    }
+
+    const auto result = ::read(handle_.value(), buff.data(), buff.size());
+    if(result == -1) {
+        return std::make_pair(false, 0);
+    }
+    if(result < buff.size()) {
+        buff[result] = '\0';
+    }
+    else {
+        buff.back() = '\0';
+    }
+
+    return std::make_pair(true, result);
+}
+
+inline std::pair<bool, size_t>
+tml::NamedPipe::send(const void* buff, const size_t len) const noexcept {
+    if(len == 0 || !is_open()) {
+        return std::make_pair(false, 0);
+    }
+
+    pollfd fds[1] = { 0 };
+    fds[0].fd     = handle_.value();
+    fds[0].events = POLLOUT;
+
+    if(::poll(fds, 1, -1) == -1 || !(fds[0].revents & POLLOUT)) {
+        return std::make_pair(false, 0);
+    }
+
+    const auto result = ::write(handle_.value(), buff, len);
+    return result == -1
+      ? std::make_pair(false, static_cast<size_t>(0))
+      : std::make_pair(true, static_cast<size_t>(result));
+}
+
+inline std::pair<bool, size_t>
+tml::NamedPipe::send(std::vector<uint8_t>& buff) const noexcept {
+    if(buff.empty() || !is_open()) {
+        return std::make_pair(false, 0);
+    }
+
+    pollfd fds[1] = { 0 };
+    fds[0].fd     = handle_.value();
+    fds[0].events = POLLOUT;
+
+    if(::poll(fds, 1, -1) == -1 || !(fds[0].revents & POLLOUT)) {
+        return std::make_pair(false, 0);
+    }
+
+    const auto result =  ::write(handle_.value(), buff.data(), buff.size());
+    return result == -1
+      ? std::make_pair(false, static_cast<size_t>(0))
+      : std::make_pair(true, static_cast<size_t>(result));
+}
+
+inline std::pair<bool, size_t>
+tml::NamedPipe::send(const NativeString& buff) const noexcept {
+    if(buff.empty() || !is_open()) {
+        return std::make_pair(false, 0);
+    }
+
+    pollfd fds[1] = { 0 };
+    fds[0].fd     = handle_.value();
+    fds[0].events = POLLOUT;
+
+    if(::poll(fds, 1, -1) == -1 || !(fds[0].revents & POLLOUT)) {
+        return std::make_pair(false, 0);
+    }
+
+    const auto result =  ::write(handle_.value(), buff.data(), buff.size());
+    return result == -1
+      ? std::make_pair(false, static_cast<size_t>(0))
+      : std::make_pair(true, static_cast<size_t>(result));
+}
+
+template<size_t len>
+auto tml::NamedPipe::send(FlatBuffer<len> &buff) const noexcept -> std::pair<bool, size_t> {
+    if(len == 0 || !is_open()) {
+        return std::make_pair(false, 0);
+    }
+
+    pollfd fds[1] = { 0 };
+    fds[0].fd     = handle_.value();
+    fds[0].events = POLLOUT;
+
+    if(::poll(fds, 1, -1) == -1 || !(fds[0].revents & POLLOUT)) {
+        return std::make_pair(false, 0);
+    }
+
+    const auto result = ::write(handle_.value(), buff.data(), buff.size());
+    return result == -1
+      ? std::make_pair(false, 0)
+      : std::make_pair(true, result);
+}
+
+inline void
+tml::NamedPipe::_on_receive_dyn_impl(
+    TML_VALUE_PARAM DynamicBufferCallback cb,
+    TML_VALUE_PARAM const OutputDevice::Value value,
+    TML_VALUE_PARAM size_t buff_len
+) {
+    if(buff_len == 0) {
+        buff_len = 1024;
+    }
+
+    std::vector<uint8_t> buffer(buff_len);
+    pollfd fds[1] = { 0 };
+    fds[0].fd     = value;
+    fds[0].events = POLLIN;
+
+    while(true) {
+        if(::poll(fds, 1, -1) == -1 || !(fds[0].revents & POLLIN)) {
+            break;
+        }
+
+        fds[0].revents = 0;
+        const auto read_res = ::read(value, buffer.data(), buffer.size());
+        if(read_res < 0) {
+            break;
+        }
+
+        buffer.resize(static_cast<size_t>(read_res));
+        cb(buffer);
+        buffer.resize(buff_len);
+        std::ranges::fill(buffer, '\0');
+    }
+}
+
+inline void
+tml::NamedPipe::_on_receive_aligned_impl(
+    TML_VALUE_PARAM AlignedBufferCallback cb,
+    TML_VALUE_PARAM const OutputDevice::Value value,
+    TML_VALUE_PARAM size_t buff_len
+) {
+    if(buff_len == 0) {
+        buff_len = 1024;
+    }
+
+    const AlignedFlatBuffer buffer(buff_len);
+    pollfd fds[1] = { 0 };
+    fds[0].fd     = value;
+    fds[0].events = POLLIN;
+
+    while(true) {
+        if(::poll(fds, 1, -1) == -1 || !(fds[0].revents & POLLIN)) {
+            break;
+        }
+
+        fds[0].revents = 0;
+        if(::read(value, buffer.data(), buffer.size()) < 0) {
+            break;
+        }
+
+        cb(buffer);
+        memset(buffer.data(), '\0', buffer.size());
+    }
+}
+
+inline void
+tml::NamedPipe::on_receive(TML_VALUE_PARAM AlignedBufferCallback cb, const size_t buff_len) const {
+    if(!cb || !is_open()) {
+        return;
+    }
+    std::thread(_on_receive_aligned_impl, cb, handle_.value(), buff_len).detach();
+}
+
+inline void
+tml::NamedPipe::on_receive(TML_VALUE_PARAM DynamicBufferCallback cb, const size_t buff_len) const {
+    if(!cb || !is_open()) {
+        return;
+    }
+    std::thread(_on_receive_dyn_impl, cb, handle_.value(), buff_len).detach();
+}
+
+inline bool
+tml::NamedPipe::destroy() {
+    if(name_.empty()) {
+        return false;
+    }
+
+    if(is_open()) {
+        handle_.close();
+        handle_.invalidate();
+    }
+
+    ::unlink(name_.c_str());
+    return true;
+}
+
+#endif // #if defined (TML_WINDOWS)
+
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// ~ Begin tml::Handle methods. ~
+////////////////////////////////////////////////////////////////////////////////////////////////////
 
 TML_ATTR_FORCEINLINE bool
 tml::Handle::is_invalid_handle_state(const Value value) {
@@ -749,6 +1126,7 @@ tml::OutputDevice::get_invalid_handle_state() {
 
 inline void
 tml::OutputDevice::close() {
+    CancelIoEx(value_, nullptr);
     if(is_invalid_handle_state(value_) || !CloseHandle(value_)) {
         return;
     }
@@ -794,9 +1172,9 @@ tml::OutputDevice::create_file(const NativeString& name, const bool append) {
     return device;
 }
 
-inline tml::OutputDevice::Pipe
+inline tml::OutputDevice::AnonymousPipe
 tml::OutputDevice::create_pipe() {
-    Pipe pipe;
+    AnonymousPipe pipe;
     pipe.read_end.type_   = Type::PipeEnd;
     pipe.write_end.type_  = Type::PipeEnd;
 
@@ -844,14 +1222,14 @@ tml::OutputDevice::create_file(const NativeString& name, const bool append) {
     return device;
 }
 
-inline tml::OutputDevice::Pipe
+inline tml::OutputDevice::AnonymousPipe
 tml::OutputDevice::create_pipe() {
     int fd[2] = { 0 };
     if(pipe(fd) == -1) {
         throw TMLException::OutputDeviceCreationException();
     }
 
-    Pipe pipe;
+    AnonymousPipe pipe;
     pipe.read_end.value_  = fd[0];
     pipe.write_end.value_ = fd[1];
     pipe.read_end.type_   = Type::PipeEnd;
@@ -861,8 +1239,16 @@ tml::OutputDevice::create_pipe() {
 
 template<size_t out_size>
 auto tml::OutputDevice::read() -> FlatBuffer<out_size> {
-    FlatBuffer<out_size> out;
+    auto   out    = FlatBuffer<out_size>();
+    pollfd fds[1] = { 0 };
+    fds[0].fd     = value_;
+    fds[0].events = POLLIN;
+
     std::fill(out.begin(), out.end(), '\0');
+    if(::poll(fds, 1, -1) == -1 || !(fds[0].revents & POLLIN)) {
+        throw TMLException::OutputDeviceReadException();
+    }
+
     if(::read(value_, out.data(), out.size()) == -1) {
         throw TMLException::OutputDeviceReadException();
     }
@@ -872,6 +1258,14 @@ auto tml::OutputDevice::read() -> FlatBuffer<out_size> {
 
 template<size_t out_size>
 auto tml::OutputDevice::read_into(FlatBuffer<out_size>& out) -> void {
+    pollfd fds[1] = { 0 };
+    fds[0].fd     = value_;
+    fds[0].events = POLLIN;
+
+    if(::poll(fds, 1, -1) == -1 || !(fds[0].revents & POLLIN)) {
+        throw TMLException::OutputDeviceReadException();
+    }
+
     if(::read(value_, out.data(), out.size()) == -1) {
         throw TMLException::OutputDeviceReadException();
     }
@@ -1022,19 +1416,19 @@ tml::Process::operator=(Process&& other) noexcept {
 
 inline
 tml::Process::Process(Process&& other) noexcept
-    : handle_(other.handle_),
-     name_(std::move(other.name_)),
-     working_directory_(std::move(other.working_directory_)),
-     arguments_(std::move(other.arguments_)),
-     callback_buffer_hint_(other.callback_buffer_hint_),
+  : handle_(other.handle_),
+    name_(std::move(other.name_)),
+    working_directory_(std::move(other.working_directory_)),
+    arguments_(std::move(other.arguments_)),
+    callback_buffer_hint_(other.callback_buffer_hint_),
 #if defined(TML_LINUX) || defined(TML_MACOS)
     posix_cached_exit_code_(other.posix_cached_exit_code_),
 #endif
-     output_callback_worker_(std::move(other.output_callback_worker_)),
-     exit_callback_worker_(std::move(other.exit_callback_worker_)),
-     output_(other.output_),
-     output_callback_(std::move(other.output_callback_)),
-     exit_callback_(std::move(other.exit_callback_))
+    output_callback_worker_(std::move(other.output_callback_worker_)),
+    exit_callback_worker_(std::move(other.exit_callback_worker_)),
+    output_(other.output_),
+    output_callback_(std::move(other.output_callback_)),
+    exit_callback_(std::move(other.exit_callback_))
 {
     other.output_          = std::monostate();
     other.exit_callback_   = std::monostate();
@@ -1089,10 +1483,8 @@ tml::Process::working_directory(const NativeString &dir) {
     return *this;
 }
 
-template<typename Callback> requires
-    std::constructible_from<tml::Process::AlignedBufferOutputCallback, Callback> ||
-    std::constructible_from<tml::Process::DynamicBufferOutputCallback, Callback>
-auto tml::Process::buffer_redirect(const size_t buff_size, Callback callback) -> Process& {
+template<typename T> requires tml::BufferCallback<T>
+auto tml::Process::buffer_redirect(const size_t buff_size, T callback) -> Process& {
     if(    !std::holds_alternative<std::monostate>(output_)
         || !std::holds_alternative<std::monostate>(output_callback_)) {
         return *this;
@@ -1165,7 +1557,7 @@ tml::Process::_launch_exit_wait_impl(
 inline void
 tml::Process::_launch_pipe_aligned_read_impl(
     TML_VALUE_PARAM const OutputDevice::Value pipe_end,
-    TML_VALUE_PARAM AlignedBufferOutputCallback cb,
+    TML_VALUE_PARAM AlignedBufferCallback cb,
     size_t buffer_length
 ) {
     if(buffer_length == 0) {
@@ -1191,7 +1583,7 @@ tml::Process::_launch_pipe_aligned_read_impl(
 inline void
 tml::Process::_launch_pipe_dyn_read_impl(
     TML_VALUE_PARAM const OutputDevice::Value pipe_end,
-    TML_VALUE_PARAM DynamicBufferOutputCallback cb,
+    TML_VALUE_PARAM DynamicBufferCallback cb,
     size_t buffer_length
 ) {
     if(buffer_length == 0) {
@@ -1215,10 +1607,10 @@ tml::Process::_launch_pipe_dyn_read_impl(
 inline tml::Process&
 tml::Process::launch() {
     auto        hredirect   = OutputDevice::get_invalid_handle_state();
-    auto*       ppipe       = std::get_if<OutputDevice::Pipe>(&output_);
+    auto*       ppipe       = std::get_if<OutputDevice::AnonymousPipe>(&output_);
     auto*       pfile       = std::get_if<OutputDevice>(&output_);
-    const auto* pdyncb      = std::get_if<DynamicBufferOutputCallback>(&output_callback_);
-    const auto* palignedcb  = std::get_if<AlignedBufferOutputCallback>(&output_callback_);
+    const auto* pdyncb      = std::get_if<DynamicBufferCallback>(&output_callback_);
+    const auto* palignedcb  = std::get_if<AlignedBufferCallback>(&output_callback_);
     const auto* pexitcb     = std::get_if<OnExitCallback>(&exit_callback_);
 
     PROCESS_INFORMATION proc_info = { 0 }; // Stores process information: process and thread handles.
@@ -1328,7 +1720,7 @@ tml::Process::~Process() {
         pfile->invalidate();
     }
 
-    if(auto* ppipe = std::get_if<OutputDevice::Pipe>(&output_)) {
+    if(auto* ppipe = std::get_if<OutputDevice::AnonymousPipe>(&output_)) {
         ppipe->read_end  .close();
         ppipe->write_end .close();
         ppipe->read_end  .invalidate();
@@ -1347,7 +1739,7 @@ tml::Process::~Process() {
 
 [[noreturn]] inline void
 tml::Process::_posix_child_launch_impl() {
-    auto* pipe_ptr    = std::get_if<OutputDevice::Pipe>(&output_);
+    auto* pipe_ptr    = std::get_if<OutputDevice::AnonymousPipe>(&output_);
     auto* file_ptr    = std::get_if<OutputDevice>(&output_);
     auto  hredirect   = OutputDevice::get_invalid_handle_state();
     std::vector argv  = { const_cast<char*>(name_.c_str()) };
@@ -1383,9 +1775,9 @@ tml::Process::_posix_child_launch_impl() {
 
 inline void
 tml::Process::_posix_parent_launch_impl() {
-    auto*       ppipe       = std::get_if<OutputDevice::Pipe>(&output_);
-    const auto* pdyncb      = std::get_if<DynamicBufferOutputCallback>(&output_callback_);
-    const auto* palignedcb  = std::get_if<AlignedBufferOutputCallback>(&output_callback_);
+    auto*       ppipe       = std::get_if<OutputDevice::AnonymousPipe>(&output_);
+    const auto* pdyncb      = std::get_if<DynamicBufferCallback>(&output_callback_);
+    const auto* palignedcb  = std::get_if<AlignedBufferCallback>(&output_callback_);
     const auto* pexitcb     = std::get_if<OnExitCallback>(&exit_callback_);
 
     //
@@ -1476,15 +1868,28 @@ tml::Process::_launch_exit_wait_impl(
 inline void
 tml::Process::_launch_pipe_aligned_read_impl(
     TML_VALUE_PARAM const OutputDevice::Value pipe_end,
-    TML_VALUE_PARAM AlignedBufferOutputCallback cb,
+    TML_VALUE_PARAM AlignedBufferCallback cb,
     size_t buffer_length
 ) {
     if(buffer_length == 0) {
         buffer_length = 200;
     }
 
+    pollfd fds[1] = { 0 };
+    fds[0].fd     = pipe_end;
+    fds[0].events = POLLIN;
+
     const AlignedFlatBuffer buffer(buffer_length);
-    while(::read(pipe_end, buffer.data(), buffer.size()) > 0) {
+    while(true) {
+        if(::poll(fds, 1, -1) == -1 || !(fds[0].revents & POLLIN)) {
+            break;
+        }
+
+        fds[0].revents = 0;
+        if(::read(pipe_end, buffer.data(), buffer.size()) < 0) {
+            break;
+        }
+
         cb(buffer);
     }
 }
@@ -1492,15 +1897,28 @@ tml::Process::_launch_pipe_aligned_read_impl(
 inline void
 tml::Process::_launch_pipe_dyn_read_impl(
     TML_VALUE_PARAM const OutputDevice::Value pipe_end,
-    TML_VALUE_PARAM DynamicBufferOutputCallback cb,
+    TML_VALUE_PARAM DynamicBufferCallback cb,
     size_t buffer_length
 ) {
     if(buffer_length == 0) {
         buffer_length = 200;
     }
 
+    pollfd fds[1] = { 0 };
+    fds[0].fd     = pipe_end;
+    fds[0].events = POLLIN;
+
     std::vector<uint8_t> buffer(buffer_length);
-    while(::read(pipe_end, buffer.data(), buffer.size())) {
+    while(true) {
+        if(::poll(fds, 1, -1) == -1 || !(fds[0].revents & POLLIN)) {
+            break;
+        }
+
+        fds[0].revents = 0;
+        if(::read(pipe_end, buffer.data(), buffer.size()) < 0) {
+            break;
+        }
+
         cb(buffer);
         std::ranges::fill(buffer, static_cast<uint8_t>('\0'));
     }
@@ -1578,7 +1996,7 @@ tml::Process::~Process() {
         pfile->invalidate();
     }
 
-    if(auto* ppipe = std::get_if<OutputDevice::Pipe>(&output_)) {
+    if(auto* ppipe = std::get_if<OutputDevice::AnonymousPipe>(&output_)) {
         ppipe->read_end  .close();
         ppipe->write_end .close();
         ppipe->read_end  .invalidate();
