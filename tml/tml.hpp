@@ -23,7 +23,7 @@
 
 #if defined(TML_WINDOWS)
     #include <Windows.h>
-    #define ns(STR) (STR##L)
+    #define ns(STR) (L##STR)
 #else // POSIX
     #include <unistd.h>
     #include <csignal>
@@ -33,6 +33,7 @@
     #include <sys/stat.h>
     #include <fcntl.h>
     #include <poll.h>
+    #include <semaphore.h>
     #define ns(STR) ((const char*)u8##STR)
 #endif
 
@@ -65,7 +66,7 @@
 #include <array>
 #include <chrono>
 
-// Classes
+
 namespace tml {
     class Process;
     class Group;
@@ -76,38 +77,48 @@ namespace tml {
     class NamedPipe;
     class SharedRegion;
     class AlignedFlatBuffer;
+    class Lock;
     struct ExitCode;
 }
 
-// Type Aliases
 namespace tml {
-#if defined(TML_WINDOWS)
-    using NativeString = std::wstring;
-    using NativeChar   = wchar_t;
-#else
-    using NativeString = std::string;
-    using NativeChar   = char;
-#endif
-
-    template<size_t len>
-    using FlatBuffer = std::array<uint8_t, len>;
     using AlignedBufferCallback = std::function<void(const AlignedFlatBuffer&)>;
     using DynamicBufferCallback = std::function<void(const std::vector<uint8_t>&)>;
     using OnExitCallback        = std::function<void(const ExitCode&)>;
+
+    template<size_t len>
+    using FlatBuffer = std::array<uint8_t, len>;
 
     template<typename T>
     concept BufferCallback =
         std::constructible_from<AlignedBufferCallback, T> ||
         std::constructible_from<DynamicBufferCallback, T>;
+
+    template<typename T>
+    concept Lockable = std::is_base_of_v<tml::Lock, T>;
+
+    template<size_t>
+    class NamedSemaphore;
+
+    template<tml::Lockable T>
+    class LockGuard;
+
+#if defined(TML_WINDOWS)
+    using NativeString = std::wstring;
+    using NativeChar   = wchar_t;
+    class NamedMutex;
+#else
+    using NativeString = std::string;
+    using NativeChar   = char;
+    using NamedMutex   = NamedSemaphore<1>;
+#endif
 }
 
-// Utility
 namespace tml {
     std::string last_system_error();
     [[noreturn]] void _panic_impl(const std::string& file, int line, const std::string& msg = "");
 }
 
-// this_process helper namespace
 namespace tml::this_process {
     [[nodiscard]] Handle get();
     [[nodiscard]] OutputDevice out();
@@ -121,12 +132,8 @@ namespace tml::this_process {
 // ~ tml::DeferredAction ~
 // - A very basic RAII wrapper around an invocable object.
 // - Calls the invocable object when the destructor is invoked.
-// - Comes with two macros to make using the class cleaner.
-//
-
-#define tml_defer(action)               auto _ = tml::DeferredAction(action);
-#define tml_defer_if(condition, action) auto _ = tml::DeferredAction(condition, action);
-
+// - Comes with two macros, tml_defer, and tml_defer_if to make using the class cleaner.
+////////////////////////////////////////////////////////////////////////////////////////////////////
 class tml::DeferredAction {
     std::function<void()> action_;
     bool condition_       = false;
@@ -142,15 +149,15 @@ public:
         using_condition_(true) {}
 };
 
+#define tml_defer(action)               auto _ = tml::DeferredAction(action);
+#define tml_defer_if(condition, action) auto _ = tml::DeferredAction(condition, action);
+
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // ~ tml::AlignedFlatBuffer ~
 // - represents a page aligned, non-reallocatable block of virtual memory.
-// - Stores a pointer and a size.
-// - Used to read from pipes without using std::vector.
 // - Preferred over tml::FlatBuffer when the size of the allocation cannot be known at compile time.
-//
-
+////////////////////////////////////////////////////////////////////////////////////////////////////
 class tml::AlignedFlatBuffer {
 public:
     void  destroy() noexcept;
@@ -169,12 +176,12 @@ private:
     size_t size_   = 0;
 };
 
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // ~ tml::Handle ~
 // - represents a medium of interaction with a child process
 // - provides methods to close handles and kill processes
-//
-
+////////////////////////////////////////////////////////////////////////////////////////////////////
 class tml::Handle {
 public:
 #if defined(TML_WINDOWS)
@@ -193,6 +200,11 @@ public:
     static bool is_invalid_handle_state(Value value);
     static Value get_invalid_handle_state();
 
+    bool operator==(const Handle& other)       const noexcept;
+    bool operator==(Handle::Value other) const noexcept;
+    bool operator!=(const Handle& other)       const noexcept;
+    bool operator!=(Handle::Value other) const noexcept;
+
     ~Handle() = default;
     explicit Handle(const Value value) : value_(value) {}
 private:
@@ -204,8 +216,7 @@ private:
 // ~ tml::ExitCode ~
 // - represents the exit code of a child process.
 // - the actual code value is DWORD on windows and int on linux.
-//
-
+////////////////////////////////////////////////////////////////////////////////////////////////////
 struct tml::ExitCode {
 #if defined(TML_WINDOWS)
     using Value = ::DWORD;
@@ -233,8 +244,7 @@ struct tml::ExitCode {
 // ~ tml::OutputDevice ~
 // - represents an output stream that can be written to by processes.
 // - can be a pipe, file, or some other resource that stdout can be redirected to.
-//
-
+////////////////////////////////////////////////////////////////////////////////////////////////////
 class tml::OutputDevice {
 public:
 #if defined(TML_WINDOWS)
@@ -262,12 +272,16 @@ public:
     static auto is_invalid_handle_state(Value value)               -> bool;
     static auto create(Value val, Type type)                       -> OutputDevice;
     static auto create_file(const NativeString& name, bool append) -> OutputDevice;
-    static auto create_named_pipe()                                -> OutputDevice;
     static auto create_pipe()                                      -> AnonymousPipe;
+
+    bool operator==(const OutputDevice& other)       const noexcept;
+    bool operator==(const OutputDevice::Value other) const noexcept;
+    bool operator!=(const OutputDevice& other)       const noexcept;
+    bool operator!=(const OutputDevice::Value other) const noexcept;
 
     ~OutputDevice() = default;
     OutputDevice() : value_(get_invalid_handle_state()) {}
-    explicit OutputDevice(const Value value) : value_(value) {}
+    OutputDevice(const Value value) : value_(value) {}
 
 private:
     Value value_{};
@@ -283,12 +297,133 @@ struct tml::OutputDevice::AnonymousPipe {
 
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+// ~ tml::Lock ~
+// - Base class for tml::NamedSemaphore and (on Windows) tml::NamedMutex
+////////////////////////////////////////////////////////////////////////////////////////////////////
+class tml::Lock {
+public:
+#if defined(TML_WINDOWS)
+    using Value = ::HANDLE;
+#else
+    using Value = ::sem_t*;
+#endif
+
+    enum class Result : uint8_t {
+        Acquired,  // The lock has been acquired by the calling thread.
+        Blocked,   // Another thread has control over the lock, and it can't be acquired.
+        Abandoned, // The owner of the lock was terminated before it could release it. The calling thread now owns this lock.
+        BadCall,   // An argument is invalid, or you tried to acquire the lock on an invalid mutex or semaphore.
+        Error,     // An error occurred while trying to acquire the lock, Check tml::last_system_error().
+    };
+
+    virtual Result try_lock() = 0;
+    virtual Result lock()     = 0;
+    virtual bool is_valid()   = 0;
+    virtual void unlock()     = 0;
+    virtual void destroy()    = 0;
+    virtual void close()      = 0;
+
+    static Value get_invalid_handle_state();
+    static bool  is_invalid_handle_state(const Value val);
+
+    Lock() : value_(get_invalid_handle_state()) {}
+    virtual ~Lock() = default;
+protected:
+    Value value_;
+};
+
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// ~ tml::NamedSemaphore ~
+// - An object that can be "locked" across different processes.
+// - Constructor specifies the amount of processes that can lock the semaphore at once.
+////////////////////////////////////////////////////////////////////////////////////////////////////
+template<size_t num_slots>
+class tml::NamedSemaphore final : public tml::Lock {
+    static_assert(num_slots > 0, "Number of semaphore slots must be greater than 0.");
+public:
+
+    Result lock()     override;
+    Result try_lock() override;
+    bool is_valid()   override;
+    void unlock()     override;
+    void destroy()    override;
+    void close()      override;
+
+    NamedSemaphore() = default;
+    ~NamedSemaphore() override = default;
+};
+
+
+#if defined(TML_WINDOWS)
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// ~ tml::NamedMutex ~
+// - On Windows: an object that can be "locked" across different processes.
+// - Can only be locked by one process at a time.
+// - On POSIX systems, NamedMutex is an alias for NamedSemaphore<1> because mutexes are not IP.
+// - This trick avoids having to do more complex things like map mutexes into shared memory.
+////////////////////////////////////////////////////////////////////////////////////////////////////
+class tml::NamedMutex final : public tml::Lock {
+public:
+    NamedMutex(NamedMutex&&)            noexcept;
+    NamedMutex& operator=(NamedMutex&&) noexcept;
+
+    Result try_lock() override;
+    Result lock()     override;
+    bool is_valid()   override;
+    void unlock()     override;
+    void destroy()    override;
+    void close()      override;
+
+    static NamedMutex create(const NativeString& name, bool immediate_lock = false);
+    static NamedMutex create_or_open(const NativeString& name, bool immediate_lock = false);
+    static NamedMutex open(const NativeString& name);
+
+    ~NamedMutex() override = default;
+private:
+    NamedMutex() = default;
+};
+#endif
+
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// ~ tml::LockGuard ~
+// - RAII wrapper around lockable IPC mechanisms.
+// - Very similar to std::lock_guard
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template<tml::Lockable T>
+class tml::LockGuard {
+public:
+    LockGuard(const LockGuard&)             = delete;
+    LockGuard& operator=(const LockGuard&)  = delete;
+    LockGuard(const LockGuard&&)            = delete;
+    LockGuard& operator=(const LockGuard&&) = delete;
+
+    bool has_lock() const;
+    ~LockGuard()                 noexcept;
+    explicit LockGuard(T&, bool) noexcept;
+    explicit LockGuard(T&)       noexcept;
+private:
+    T& lock_;
+    bool locked_ = false;
+};
+
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
 // ~ tml::NamedPipe ~
 // - represents an IPC mechanism for sending messages between processes.
-//
-
+// - bidirectional if needed. Can be read and written to by any client.
+// - only call NamedPipe::destroy() from the named pipe "server" process, i.e. the parent.
+////////////////////////////////////////////////////////////////////////////////////////////////////
 class tml::NamedPipe {
 public:
+
+    enum class AccessType : uint8_t {
+        Read,   // Read-only mode: the calling thread is blocked until a writer connects.
+        Write,  // The pipe cannot be read from by this process.
+        Duplex  // The pipe can be written to and read from by this process. No blocking occurs on open.
+    };
 
     template<size_t len = 1024>
     std::pair<bool, size_t> receive(FlatBuffer<len>& buff)       const noexcept;
@@ -309,9 +444,10 @@ public:
     void invalidate();
     bool destroy();
     [[nodiscard]] bool is_open() const;
+    [[nodiscard]] const NativeString& name() const;
 
-    static NamedPipe create(const NativeString& name)  noexcept;
-    static NamedPipe connect(const NativeString& name) noexcept;
+    static NamedPipe create(const NativeString& name, AccessType = AccessType::Duplex)  noexcept;
+    static NamedPipe connect(const NativeString& name, AccessType = AccessType::Duplex) noexcept;
 
     ~NamedPipe() = default;
 private:
@@ -319,10 +455,7 @@ private:
     static void _on_receive_dyn_impl(DynamicBufferCallback cb, OutputDevice::Value value, size_t buff_len = 1024);
 
     OutputDevice handle_;
-#if defined(TML_MACOS) || defined(TML_LINUX)
-    NativeString name_; // because we can't delete a file with only an fd.
-#endif
-
+    NativeString name_;
     NamedPipe() = default;
 };
 
@@ -334,7 +467,7 @@ private:
 // - process could not be started.
 // - process could not be killed.
 // - handle could not be closed.
-//
+////////////////////////////////////////////////////////////////////////////////////////////////////
 
 #define TML_EXCEPTION_TYPE_LIST          \
     TML_X(None)                          \
@@ -345,7 +478,6 @@ private:
     TML_X(OutputDeviceCloseException)    \
     TML_X(FileSystemException)           \
     TML_X(SystemMemoryException)         \
-
 
 class tml::TMLException final : public std::exception {
 public:
@@ -379,8 +511,7 @@ private:
 // - registering callbacks for important events (exit, write to stdout, etc)
 // - terminating processes
 // - set important things like working directories
-//
-
+////////////////////////////////////////////////////////////////////////////////////////////////////
 class tml::Process {
 public:
     ///////////////////////////////////////////////////////////////////////////////////////
@@ -518,7 +649,7 @@ tml::this_process::get() {
 }
 
 inline std::string
-last_system_error() {
+tml::last_system_error() {
     DWORD err_code = GetLastError();
     DWORD result   = 0;
     LPSTR outbuf   = nullptr;
@@ -639,12 +770,350 @@ tml::NamedPipe::invalidate() {
     handle_.invalidate();
 }
 
+TML_ATTR_FORCEINLINE const tml::NativeString&
+tml::NamedPipe::name() const {
+    return name_;
+}
+
+inline void
+tml::NamedPipe::on_receive(TML_VALUE_PARAM AlignedBufferCallback cb, const size_t buff_len) const {
+    if(!cb || !is_open()) {
+        return;
+    }
+    std::thread(_on_receive_aligned_impl, cb, handle_.value(), buff_len).detach();
+}
+
+inline void
+tml::NamedPipe::on_receive(TML_VALUE_PARAM DynamicBufferCallback cb, const size_t buff_len) const {
+    if(!cb || !is_open()) {
+        return;
+    }
+    std::thread(_on_receive_dyn_impl, cb, handle_.value(), buff_len).detach();
+}
+
+
 #if defined (TML_WINDOWS)
+
+inline tml::NamedPipe
+tml::NamedPipe::create(const NativeString &name, const AccessType access) noexcept {
+    NamedPipe   pipe;
+    const auto  full   = NativeString(L"(\\\\.\\pipe\\)") + name;
+    const DWORD flags  = [&]() -> DWORD {
+        switch(access) {
+            case AccessType::Read:   return PIPE_ACCESS_INBOUND;
+            case AccessType::Write:  return PIPE_ACCESS_OUTBOUND;
+            default:                 return PIPE_ACCESS_DUPLEX;
+        }
+    }();
+
+    // https://learn.microsoft.com/en-us/windows/win32/api/namedpipeapi/nf-namedpipeapi-createnamedpipew
+    pipe.handle_ = CreateNamedPipeW(
+        full.c_str(),                    // Name of the pipe, must follow the "\\.\pipe\<NAME>" format
+        flags,                           // Access modifier for this pipe (read/write/duplex)
+        PIPE_TYPE_BYTE                   // Pipe is opened in byte stream mode rather than message mode.
+          | PIPE_READMODE_BYTE           // Read operations treat data as a byte stream
+          | PIPE_WAIT                    // Indicates that ReadFile and WriteFile should block.
+          | PIPE_REJECT_REMOTE_CLIENTS,  // Reject remote clients (out of scope for this library)
+        PIPE_UNLIMITED_INSTANCES,        // Unlimited concurrent connections
+        1024,                            // Internal output (write) buffer size. Does not effect the amount of data you can write.
+        1024,                            // Internal input (read) buffer size. Does not effect the amount of data you can write.
+        0,                               // Timeout value. not relevant.
+        nullptr                          // Pointer to an OVERLAPPED structure for overlapped IO. Not relevant.
+    );
+
+    // IMPORTANT:
+    // Handle::is_invalid_handle_state checks for nullptr on Windows, NOT "INVALID_HANDLE_STATE".
+    // This is a somewhat rare Win32 handle value, as usually NULL indicates an invalid handle state.
+    // If we encounter it, we should generally just set the handle value to be nullptr
+    // to indicate an invalid state to avoid any confusion.
+
+    if(pipe.handle_ == INVALID_HANDLE_VALUE) {
+        pipe.handle_ = nullptr;
+        return pipe;
+    }
+
+    if(access == AccessType::Read) {
+        ConnectNamedPipe(pipe.handle_.value(), nullptr);
+    }
+
+    pipe.name_ = full;
+    return pipe;
+}
+
+inline tml::NamedPipe
+tml::NamedPipe::connect(const NativeString &name, const AccessType access) noexcept {
+    NamedPipe   pipe;
+    const auto  full   = NativeString(L"(\\\\.\\pipe\\)") + name;
+    const DWORD flags  = [&]() -> DWORD {
+        switch(access) {
+            case AccessType::Read:   return GENERIC_READ;
+            case AccessType::Write:  return GENERIC_WRITE;
+            default:                 return GENERIC_READ | GENERIC_WRITE;
+        }
+    }();
+
+    pipe.handle_ = CreateFileW(
+        full.c_str(),
+        flags,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        nullptr,
+        OPEN_EXISTING,         // File MUST already exist. Do not create one if it doesn't.
+        0,                     // No file attribute flags.
+        nullptr
+    );
+
+    if(pipe.handle_ == INVALID_HANDLE_VALUE) {
+        pipe.handle_ = nullptr;
+        return pipe;
+    }
+
+    if(access == AccessType::Read) {
+        WaitNamedPipeW(full.c_str(), NMPWAIT_WAIT_FOREVER);
+    }
+
+    pipe.name_ = full;
+    return pipe;
+}
+
+inline void
+tml::NamedPipe::_on_receive_aligned_impl(
+    TML_VALUE_PARAM AlignedBufferCallback cb,
+    TML_VALUE_PARAM const OutputDevice::Value value,
+    TML_VALUE_PARAM size_t buff_len
+) {
+    if(buff_len == 0) {
+        buff_len = 1024;
+    }
+
+    DWORD bytes_read = 0;
+    const AlignedFlatBuffer buffer(buff_len);
+    while(ReadFile(
+        value,
+        buffer.data(),
+        buffer.size(),
+        &bytes_read,
+        nullptr
+    ) && bytes_read > 0) {
+        cb(buffer);
+        memset(buffer.data(), '\0', buffer.size());
+    }
+}
+
+inline void
+tml::NamedPipe::_on_receive_dyn_impl(
+    TML_VALUE_PARAM DynamicBufferCallback cb,
+    TML_VALUE_PARAM const OutputDevice::Value value,
+    TML_VALUE_PARAM size_t buff_len
+) {
+    if(buff_len == 0) {
+        buff_len = 1024;
+    }
+
+    std::vector<uint8_t> buffer(buff_len);
+    DWORD bytes_read = 0;
+    while(ReadFile(
+        value,
+        buffer.data(),
+        buffer.size(),
+        &bytes_read,
+        nullptr
+    ) && bytes_read > 0) {
+        buffer.resize(static_cast<size_t>(bytes_read));
+        cb(buffer);
+        buffer.resize(buff_len);
+        std::ranges::fill(buffer, '\0');
+    }
+}
+
+inline bool
+tml::NamedPipe::destroy() {
+    if(name_.empty()) {
+        return false;
+    }
+
+    // Note: if NamedPipe::destroy() on Windows is called from a "client" process,
+    // this function has NO effect whatsoever. DisconnectNamedPipe will fail,
+    // because handle_ will not be a named pipe handle, it will be a handle
+    // to a file object, which behaves differently.
+    // If this function is called from the named pipe "server" process,
+    // It will boot all waiting clients off of the pipe if there are any,
+    // before closing the handle. On Windows, once all handles to a named pipe are closed,
+    // it is deleted. For this reason, we do not call DeleteFile or attempt to delete
+    // the named pipe manually, unlike with a POSIX NamedPipe where we call unlink().
+
+    DisconnectNamedPipe(handle_.value());
+    handle_.close();
+    return true;
+}
+
+inline std::pair<bool, size_t>
+tml::NamedPipe::receive(std::vector<uint8_t> &buff) const noexcept {
+    if(buff.empty() || !is_open()) {
+        return std::make_pair(false, 0);
+    }
+
+    DWORD bytes_read  = 0;
+    const BOOL result = ReadFile(
+        handle_.value(),
+        buff.data(),
+        static_cast<DWORD>(buff.size()),
+        &bytes_read,
+        nullptr
+    );
+
+    return result == FALSE
+      ? std::make_pair(false, static_cast<size_t>(0))
+      : std::make_pair(true,  static_cast<size_t>(bytes_read));
+}
+
+inline std::pair<bool, size_t>
+tml::NamedPipe::receive(NativeString &buff, const size_t len) const noexcept {
+    if(len != 0) {
+        buff.resize(len);
+    }
+    if(!is_open() || buff.empty()) {
+        return std::make_pair(false, 0);
+    }
+
+    DWORD bytes_read  = 0;
+    const BOOL result = ReadFile(
+        handle_.value(),
+        buff.data(),
+        static_cast<DWORD>(buff.size()),
+        &bytes_read,
+        nullptr
+    );
+
+    return result == FALSE
+      ? std::make_pair(false, static_cast<size_t>(0))
+      : std::make_pair(true,  static_cast<size_t>(bytes_read));
+}
+
+template<size_t len>
+auto tml::NamedPipe::receive(FlatBuffer<len> &buff) const noexcept -> std::pair<bool, size_t> {
+    if(len == 0 || !is_open()) {
+        return std::make_pair(false, 0);
+    }
+
+    DWORD bytes_read  = 0;
+    const BOOL result = ReadFile(
+        handle_.value(),
+        buff.data(),
+        static_cast<DWORD>(buff.size()),
+        &bytes_read,
+        nullptr
+    );
+
+    return result == FALSE
+      ? std::make_pair(false, static_cast<size_t>(0))
+      : std::make_pair(true,  static_cast<size_t>(bytes_read));
+}
+
+inline std::pair<bool, size_t>
+tml::NamedPipe::receive(void* const buff, const size_t len) const noexcept {
+    if(buff == nullptr || len == 0 || !is_open()) {
+        return std::make_pair(false, 0);
+    }
+
+    DWORD bytes_read  = 0;
+    const BOOL result = ReadFile(
+        handle_.value(),
+        buff,
+        static_cast<DWORD>(len),
+        &bytes_read,
+        nullptr
+    );
+
+    return result == FALSE
+      ? std::make_pair(false, static_cast<size_t>(0))
+      : std::make_pair(true,  static_cast<size_t>(bytes_read));
+}
+
+inline std::pair<bool, size_t>
+tml::NamedPipe::send(const void *buff, const size_t len) const noexcept {
+    if(buff == nullptr || len == 0 || !is_open()) {
+        return std::make_pair(false, 0);
+    }
+
+    DWORD bytes_wrote = 0;
+    const BOOL result = WriteFile(
+        handle_.value(),
+        buff,
+        static_cast<DWORD>(len),
+        &bytes_wrote,
+        nullptr
+    );
+
+    return result == FALSE
+      ? std::make_pair(false, static_cast<size_t>(0))
+      : std::make_pair(true,  static_cast<size_t>(bytes_wrote));
+}
+
+inline std::pair<bool, size_t>
+tml::NamedPipe::send(std::vector<uint8_t> &buff) const noexcept {
+    if(buff.empty() || !is_open()) {
+        return std::make_pair(false, 0);
+    }
+
+    DWORD bytes_wrote = 0;
+    const BOOL result = WriteFile(
+        handle_.value(),
+        buff.data(),
+        static_cast<DWORD>(buff.size()),
+        &bytes_wrote,
+        nullptr
+    );
+
+    return result == FALSE
+      ? std::make_pair(false, static_cast<size_t>(0))
+      : std::make_pair(true,  static_cast<size_t>(bytes_wrote));
+}
+
+inline std::pair<bool, size_t>
+tml::NamedPipe::send(const NativeString &buff) const noexcept {
+    if(buff.empty() || !is_open()) {
+        return std::make_pair(false, 0);
+    }
+
+    DWORD bytes_wrote = 0;
+    const BOOL result = WriteFile(
+        handle_.value(),
+        buff.data(),
+        static_cast<DWORD>(buff.size()),
+        &bytes_wrote,
+        nullptr
+    );
+
+    return result == FALSE
+      ? std::make_pair(false, static_cast<size_t>(0))
+      : std::make_pair(true,  static_cast<size_t>(bytes_wrote));
+}
+
+template<size_t len>
+auto tml::NamedPipe::send(FlatBuffer<len> &buff) const noexcept -> std::pair<bool, size_t> {
+    if(len == 0 || !is_open()) {
+        return std::make_pair(false, 0);
+    }
+
+    DWORD bytes_wrote = 0;
+    const BOOL result = WriteFile(
+        handle_.value(),
+        buff.data(),
+        static_cast<DWORD>(buff.size()),
+        &bytes_wrote,
+        nullptr
+    );
+
+    return result == FALSE
+      ? std::make_pair(false, static_cast<size_t>(0))
+      : std::make_pair(true,  static_cast<size_t>(bytes_wrote));
+}
+
 
 #else // OS == POSIX
 
 inline tml::NamedPipe
-tml::NamedPipe::create(const NativeString &name) noexcept{
+tml::NamedPipe::create(const NativeString &name, const AccessType access) noexcept{
     const auto full = NativeString("/tmp/TML_NAMED_PIPE_") + name;
     NamedPipe pipe;
 
@@ -652,13 +1121,21 @@ tml::NamedPipe::create(const NativeString &name) noexcept{
         return pipe;
     }
 
-    pipe.handle_ = OutputDevice(::open(full.c_str(), O_RDWR));
+    const int flags = [&]() -> int {
+       switch(access) {
+           case AccessType::Read:  return O_RDONLY;
+           case AccessType::Write: return O_WRONLY;
+           default:                return O_RDWR;
+       }
+    }();
+
+    pipe.handle_ = OutputDevice(::open(full.c_str(), flags));
     pipe.name_   = full;
     return pipe;
 }
 
 inline tml::NamedPipe
-tml::NamedPipe::connect(const NativeString &name) noexcept {
+tml::NamedPipe::connect(const NativeString &name, const AccessType access) noexcept {
     const auto  full      = NativeString("/tmp/TML_NAMED_PIPE_") + name;
     struct stat file_info = { 0 };
     NamedPipe pipe;
@@ -672,7 +1149,15 @@ tml::NamedPipe::connect(const NativeString &name) noexcept {
         return pipe;
     }
 
-    pipe.handle_ = OutputDevice(::open(full.c_str(), O_RDWR));
+    const int flags = [&]() -> int {
+        switch(access) {
+            case AccessType::Read:  return O_RDONLY;
+            case AccessType::Write: return O_WRONLY;
+            default:                return O_RDWR;
+        }
+    }();
+
+    pipe.handle_ = OutputDevice(::open(full.c_str(), flags));
     pipe.name_   = full;
     return pipe;
 }
@@ -755,7 +1240,7 @@ tml::NamedPipe::receive(NativeString& buff, const size_t len) const noexcept {
     }
 
     const auto result = ::read(handle_.value(), buff.data(), buff.size());
-    if(result == -1) {
+    if(result < 0) {
         return std::make_pair(false, 0);
     }
     if(result < buff.size()) {
@@ -770,7 +1255,7 @@ tml::NamedPipe::receive(NativeString& buff, const size_t len) const noexcept {
 
 inline std::pair<bool, size_t>
 tml::NamedPipe::send(const void* buff, const size_t len) const noexcept {
-    if(len == 0 || !is_open()) {
+    if(buff == nullptr || len == 0 || !is_open()) {
         return std::make_pair(false, 0);
     }
 
@@ -870,7 +1355,7 @@ tml::NamedPipe::_on_receive_dyn_impl(
 
         fds[0].revents = 0;
         const auto read_res = ::read(value, buffer.data(), buffer.size());
-        if(read_res < 0) {
+        if(read_res <= 0) {
             break;
         }
 
@@ -902,29 +1387,13 @@ tml::NamedPipe::_on_receive_aligned_impl(
         }
 
         fds[0].revents = 0;
-        if(::read(value, buffer.data(), buffer.size()) < 0) {
+        if(::read(value, buffer.data(), buffer.size()) <= 0) {
             break;
         }
 
         cb(buffer);
         memset(buffer.data(), '\0', buffer.size());
     }
-}
-
-inline void
-tml::NamedPipe::on_receive(TML_VALUE_PARAM AlignedBufferCallback cb, const size_t buff_len) const {
-    if(!cb || !is_open()) {
-        return;
-    }
-    std::thread(_on_receive_aligned_impl, cb, handle_.value(), buff_len).detach();
-}
-
-inline void
-tml::NamedPipe::on_receive(TML_VALUE_PARAM DynamicBufferCallback cb, const size_t buff_len) const {
-    if(!cb || !is_open()) {
-        return;
-    }
-    std::thread(_on_receive_dyn_impl, cb, handle_.value(), buff_len).detach();
 }
 
 inline bool
@@ -948,6 +1417,26 @@ tml::NamedPipe::destroy() {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // ~ Begin tml::Handle methods. ~
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline bool
+tml::Handle::operator!=(const Handle &other) const noexcept {
+    return this->value_ != other.value_;
+}
+
+inline bool
+tml::Handle::operator!=(const Handle::Value other) const noexcept {
+    return this->value_ != other;
+}
+
+inline bool
+tml::Handle::operator==(const Handle &other) const noexcept {
+    return this->value_ == other.value_;
+}
+
+inline bool
+tml::Handle::operator==(const Handle::Value other) const noexcept {
+    return this->value_ == other;
+}
 
 TML_ATTR_FORCEINLINE bool
 tml::Handle::is_invalid_handle_state(const Value value) {
@@ -1069,6 +1558,26 @@ tml::Handle::close() {
 // ~ Begin tml::OutputDevice methods. ~
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+inline bool
+tml::OutputDevice::operator!=(const OutputDevice &other) const noexcept {
+    return this->value_ != other.value_;
+}
+
+inline bool
+tml::OutputDevice::operator!=(const OutputDevice::Value other) const noexcept {
+    return this->value_ != other;
+}
+
+inline bool
+tml::OutputDevice::operator==(const OutputDevice &other) const noexcept {
+    return this->value_ == other.value_;
+}
+
+inline bool
+tml::OutputDevice::operator==(const OutputDevice::Value other) const noexcept {
+    return this->value_ == other;
+}
+
 inline void
 tml::OutputDevice::invalidate() {
     value_ = get_invalid_handle_state();
@@ -1152,7 +1661,9 @@ tml::OutputDevice::create_file(const NativeString& name, const bool append) {
     device.value_ = CreateFileW(
         name.c_str(),                        // Name of the file.
         flags,                               // Access flags.
-        FILE_SHARE_READ | FILE_SHARE_WRITE,  // File share mode. Mostly irrelevant.
+        FILE_SHARE_READ                      // Other processes can read from this file at the same time.
+          | FILE_SHARE_WRITE                 // Other processes can write to this file at the same time.
+          | FILE_SHARE_DELETE,               // Other processes can delete this file while it's open here.
         nullptr,                             // Security attributes for a descriptor. Optional.
         OPEN_ALWAYS,                         // Open mode.
         FILE_ATTRIBUTE_NORMAL,               // File attributes. File is normal.
@@ -1273,6 +1784,199 @@ auto tml::OutputDevice::read_into(FlatBuffer<out_size>& out) -> void {
 
 #endif // #if defined(TML_WINDOWS)
 
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// ~ Begin tml::Lockable methods. ~
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#if defined(TML_WINDOWS)
+TML_ATTR_FORCEINLINE tml::Lock::Value
+tml::Lock::get_invalid_handle_state() {
+    return nullptr;
+}
+
+TML_ATTR_FORCEINLINE bool
+tml::Lock::is_invalid_handle_state(const Value val) {
+    return val == nullptr;
+}
+
+#else // OS == POSIX
+
+TML_ATTR_FORCEINLINE tml::Lockable::Value
+tml::Lockable::get_invalid_handle_state() {
+    return SEM_FAILED;
+}
+
+TML_ATTR_FORCEINLINE bool
+tml::Lockable::is_invalid_handle_state(const Value val) {
+    return val == SEM_FAILED;
+}
+#endif // #if defined(TML_WINDOWS)
+
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// ~ Begin tml::LockGuard methods. ~
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template<tml::Lockable T>
+tml::LockGuard<T>::LockGuard(T& lock) noexcept : lock_(lock) {
+    if(!lock_.is_valid()) {
+        return;
+    }
+
+    locked_ = lock_.lock() == Lock::Result::Acquired;
+}
+
+template<tml::Lockable T>
+tml::LockGuard<T>::LockGuard(T& lock, const bool try_lock) noexcept : lock_(lock) {
+    if(!lock_.is_valid()) {
+        return;
+    }
+
+    Lock::Result res;
+    if(try_lock) {
+        res = lock_.try_lock();
+    } else {
+        res = lock_.lock();
+    }
+
+    locked_ = res == Lock::Result::Acquired;
+}
+
+template<tml::Lockable T>
+tml::LockGuard<T>::~LockGuard() noexcept {
+    if(locked_) lock_.unlock();
+}
+
+template<tml::Lockable T>
+auto tml::LockGuard<T>::has_lock() const -> bool {
+    return locked_;
+}
+
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// ~ Begin tml::NamedMutex methods. ~
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#if defined(TML_WINDOWS) // Class does not exist for POSIX
+
+inline
+tml::NamedMutex::NamedMutex(NamedMutex&& other) noexcept : Lock() {
+    value_       = other.value_;
+    other.value_ = get_invalid_handle_state();
+}
+
+inline tml::NamedMutex&
+tml::NamedMutex::operator=(NamedMutex&& other) noexcept {
+    value_       = other.value_;
+    other.value_ = get_invalid_handle_state();
+    return *this;
+}
+
+inline tml::Lock::Result
+tml::NamedMutex::lock() {
+    if(is_invalid_handle_state(value_)) {
+        return Result::BadCall;
+    }
+
+    switch(WaitForSingleObject(value_, INFINITE)) {
+        case WAIT_OBJECT_0:  return Result::Acquired;
+        case WAIT_ABANDONED: return Result::Abandoned;
+        default:             return Result::Error;
+    }
+}
+
+inline tml::Lock::Result
+tml::NamedMutex::try_lock() {
+    if(is_invalid_handle_state(value_)) {
+        return Result::BadCall;
+    }
+
+    switch(WaitForSingleObject(value_, 0)) {
+        case WAIT_OBJECT_0:  return Result::Acquired;
+        case WAIT_TIMEOUT:   return Result::Blocked;
+        case WAIT_ABANDONED: return Result::Abandoned;
+        default:             return Result::Error;
+    }
+}
+
+inline void
+tml::NamedMutex::unlock() {
+    if(is_invalid_handle_state(value_)) {
+        return;
+    }
+    ReleaseMutex(value_);
+}
+
+TML_ATTR_FORCEINLINE void
+tml::NamedMutex::close() {
+    if(!is_invalid_handle_state(value_)) {
+        CloseHandle(value_);
+        value_ = get_invalid_handle_state();
+    }
+}
+
+TML_ATTR_FORCEINLINE bool
+tml::NamedMutex::is_valid() {
+    return is_invalid_handle_state(value_);
+}
+
+TML_ATTR_FORCEINLINE void
+tml::NamedMutex::destroy() {
+    close();
+}
+
+inline tml::NamedMutex
+tml::NamedMutex::create(const NativeString& name, const bool immediate_lock) {
+    NamedMutex mtx;
+    mtx.value_ = CreateMutexW(
+        nullptr,
+        immediate_lock ? TRUE : FALSE,
+        name.c_str()
+    );
+
+    if(mtx.value_ == nullptr) {
+        return mtx;
+    } if(GetLastError() == ERROR_ALREADY_EXISTS) {
+        mtx.close();
+        return mtx;
+    }
+
+    return mtx;
+}
+
+inline tml::NamedMutex
+tml::NamedMutex::open(const NativeString &name) {
+    SetLastError(ERROR_SUCCESS);
+
+    NamedMutex mtx;
+    mtx.value_ = CreateMutexW(nullptr, FALSE, name.c_str());
+
+    if(mtx.value_ == nullptr) {
+        return mtx;
+    } if(GetLastError() != ERROR_ALREADY_EXISTS) {
+        mtx.close();
+        return mtx;
+    }
+
+    SetLastError(ERROR_SUCCESS);
+    return mtx;
+}
+
+inline tml::NamedMutex
+tml::NamedMutex::create_or_open(const NativeString &name, const bool immediate_lock) {
+    NamedMutex mtx;
+    mtx.value_ = CreateMutexW(
+        nullptr,
+        immediate_lock ? TRUE : FALSE,
+        name.c_str()
+    );
+
+    return mtx;
+}
+
+
+#endif
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // ~ Begin tml::AlignedFlatBuffer methods. ~
@@ -1886,7 +2590,7 @@ tml::Process::_launch_pipe_aligned_read_impl(
         }
 
         fds[0].revents = 0;
-        if(::read(pipe_end, buffer.data(), buffer.size()) < 0) {
+        if(::read(pipe_end, buffer.data(), buffer.size()) <= 0) {
             break;
         }
 
@@ -1915,7 +2619,7 @@ tml::Process::_launch_pipe_dyn_read_impl(
         }
 
         fds[0].revents = 0;
-        if(::read(pipe_end, buffer.data(), buffer.size()) < 0) {
+        if(::read(pipe_end, buffer.data(), buffer.size()) <= 0) {
             break;
         }
 

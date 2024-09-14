@@ -1,13 +1,12 @@
 #include "tml.hpp"
-
-int foo();
+#include <mutex>
 
 using namespace tml;
 int main() {
 
-    auto pipe = NamedPipe::create(ns("MyPipe"));
+    /*auto pipe = NamedPipe::create(ns("MyPipe"));
     if(!pipe.is_open()) {
-        std::cerr << "failed to open pipe: " << last_system_error() << std::endl;
+        std::cerr << "failed to open pipe: " << ::last_system_error() << std::endl;
         return 1;
     }
 
@@ -18,8 +17,8 @@ int main() {
         std::cout.flush();
     });
 
-    sleep(2);
+    Sleep(2);
     std::cout << "calling destroy\n";
-    pipe.destroy();
+    pipe.destroy();*/
     return 0;
 }
