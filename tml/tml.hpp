@@ -120,7 +120,8 @@ namespace tml {
 
 namespace tml {
     std::string last_system_error();
-    void spawn(const NativeString& name, const std::vector<NativeString>& args = {}, const NativeString& wd = ns(""));
+    bool system_error_exists();
+    static void spawn(const NativeString& name, const std::vector<NativeString>& args = {}, const NativeString& wd = ns(""));
     [[noreturn]] void _panic_impl(const std::string& file, int line, const std::string& msg = "");
 }
 
@@ -323,15 +324,15 @@ public:
         Error,     // An error occurred while trying to acquire the lock, Check tml::last_system_error().
     };
 
-    virtual Result try_lock() = 0;
     virtual Result lock()     = 0;
+    virtual Result try_lock() = 0;
     virtual bool is_valid()   = 0;
     virtual void unlock()     = 0;
     virtual void destroy()    = 0;
     virtual void close()      = 0;
 
     static Value get_invalid_handle_state();
-    static bool  is_invalid_handle_state(const Value val);
+    static bool  is_invalid_handle_state(Value val);
 
     Lock() : value_(get_invalid_handle_state()) {}
     virtual ~Lock() = default;
@@ -396,13 +397,16 @@ public:
     void unlock()     override;
     void destroy()    override;
     void close()      override;
+    const NativeString& name();
 
     static NamedSemaphore create(const NativeString& name, bool immediate_lock = false);
     static NamedSemaphore open(const NativeString& name);
     static NamedSemaphore create_or_open(const NativeString& name, bool immediate_lock = false);
 
-    NamedSemaphore()           = default;
     ~NamedSemaphore() override = default;
+private:
+    NativeString name_;
+    NamedSemaphore() = default;
 };
 
 
@@ -432,6 +436,7 @@ public:
 
     ~NamedMutex() override = default;
 private:
+    NativeString name_;
     NamedMutex() = default;
 };
 #endif
@@ -451,7 +456,7 @@ public:
     LockGuard(const LockGuard&&)            = delete;
     LockGuard& operator=(const LockGuard&&) = delete;
 
-    bool has_lock() const;
+    [[nodiscard]] bool has_lock() const;
     ~LockGuard()                 noexcept;
     explicit LockGuard(T&, bool) noexcept;
     explicit LockGuard(T&)       noexcept;
@@ -686,6 +691,11 @@ tml::this_process::get() {
     return Handle(GetCurrentProcess());
 }
 
+TML_ATTR_FORCEINLINE bool
+tml::system_error_exists() {
+    return GetLastError() != ERROR_SUCCESS;
+}
+
 inline std::string
 tml::last_system_error() {
     DWORD err_code = GetLastError();
@@ -717,7 +727,7 @@ tml::last_system_error() {
     return out;
 }
 
-inline void
+static void
 tml::spawn(const NativeString& name, const std::vector<NativeString>& args, const NativeString& wd) {
 
     //
@@ -790,12 +800,12 @@ tml::this_process::kill(const int status) {
 
 [[nodiscard]] inline tml::OutputDevice
 tml::this_process::out() {
-    return OutputDevice(STDOUT_FILENO);
+    return {STDOUT_FILENO};
 }
 
 [[nodiscard]] inline tml::OutputDevice
 tml::this_process::err() {
-    return OutputDevice(STDERR_FILENO);
+    return {STDERR_FILENO};
 }
 
 TML_ATTR_FORCEINLINE size_t
@@ -808,6 +818,11 @@ tml::this_process::get() {
     return Handle(getpid());
 }
 
+TML_ATTR_FORCEINLINE bool
+tml::system_error_exists() {
+    return errno != 0;
+}
+
 inline std::string
 tml::last_system_error() {
     NativeChar buffer[256] = { 0 };
@@ -815,15 +830,54 @@ tml::last_system_error() {
 
     if(err_code == 0) {
         return "";
-    }
-
-    if(strerror_r(err_code, buffer, sizeof(buffer)) == 0) {
+    } if(strerror_r(err_code, buffer, sizeof(buffer)) == 0) {
         std::string out(buffer);
         return out;
     }
 
     return "";
 }
+
+static void
+tml::spawn(const NativeString& name, const std::vector<NativeString>& args, const NativeString& wd) {
+    namespace fs = std::filesystem;
+    if(!fs::exists(wd)) {
+        throw TMLException("Working directory does not exist.",
+            TMLException::Type::FileSystemException);
+    }
+    if(!fs::is_directory(wd)) {
+        throw TMLException("Provided path is not a directory.",
+            TMLException::Type::FileSystemException);
+    }
+
+    const auto pid = ::fork();
+    if(pid < 0) {
+        throw TMLException::ProcessLaunchException();
+    }
+
+    // Child process
+    if(pid == 0) {
+        std::vector argv  = { const_cast<char*>(name.c_str()) };
+        if(!wd.empty()) {
+            ::chdir(wd.c_str());
+        }
+        for(const auto& arg : args) {
+            if(arg.empty()) continue;
+            argv.emplace_back(const_cast<char*>(arg.c_str()));
+        }
+
+        ::execvp(name.c_str(), argv.data());
+        ::exit(420);
+    }
+
+    // Parent process, make detached thread.
+    std::thread([](const pid_t _pid) {
+        int status;
+        ::waitpid(_pid, &status, 0);
+    }, pid).detach();
+}
+
+
 #endif // #if defined(TML_WINDOWS)
 
 
@@ -1939,14 +1993,13 @@ tml::Lock::is_invalid_handle_state(const Value val) {
 }
 
 #else // OS == POSIX
-
-TML_ATTR_FORCEINLINE tml::Lockable::Value
-tml::Lockable::get_invalid_handle_state() {
+TML_ATTR_FORCEINLINE tml::Lock::Value
+tml::Lock::get_invalid_handle_state() {
     return SEM_FAILED;
 }
 
 TML_ATTR_FORCEINLINE bool
-tml::Lockable::is_invalid_handle_state(const Value val) {
+tml::Lock::is_invalid_handle_state(Value val) {
     return val == SEM_FAILED;
 }
 #endif // #if defined(TML_WINDOWS)
@@ -1996,11 +2049,21 @@ auto tml::LockGuard<T>::has_lock() const -> bool {
 // ~ Begin tml::NamedSemaphore methods. ~
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+template<size_t num_slots>
+auto tml::NamedSemaphore<num_slots>::name() -> const NativeString& {
+    return name_;
+}
+
+template<size_t num_slots>
+bool tml::NamedSemaphore<num_slots>::is_valid() {
+    return Lock::is_invalid_handle_state(value_);
+}
+
 #if defined(TML_WINDOWS)
 
 template<size_t num_slots>
 auto tml::NamedSemaphore<num_slots>::close() -> void {
-    if(is_invalid_handle_state(value_)) {
+    if(Lock::is_invalid_handle_state(value_)) {
         return;
     }
 
@@ -2014,22 +2077,14 @@ auto tml::NamedSemaphore<num_slots>::destroy() -> void {
 }
 
 template<size_t num_slots>
-auto tml::NamedSemaphore<num_slots>::is_valid() -> bool {
-    return Lock::is_invalid_handle_state(value_);
-}
-
-template<size_t num_slots>
 auto tml::NamedSemaphore<num_slots>::unlock() -> void {
-    if(is_invalid_handle_state(value_)) {
-        return;
-    }
-
-    ReleaseSemaphore(value_, 1, nullptr);
+    if(!Lock::is_invalid_handle_state(value_))
+        ReleaseSemaphore(value_, 1, nullptr);
 }
 
 /* NOTE (Windows):
  * NamedSemaphore::lock() and try_lock() are essentially
- * identical to NamedMutex::lock() because the way you lock them
+ * identical to the methods by the same named on tml::Mutex because the locking method
  * using win32 is identical. This is kind of lazy, and I could
  * implement some templated solution for this, or have these functions
  * exist in the base class instead, but I think that would mess with the POSIX
@@ -2038,7 +2093,7 @@ auto tml::NamedSemaphore<num_slots>::unlock() -> void {
 
 template<size_t num_slots>
 auto tml::NamedSemaphore<num_slots>::lock() -> Result {
-    if(is_invalid_handle_state(value_)) {
+    if(Lock::is_invalid_handle_state(value_)) {
         return Result::BadCall;
     }
 
@@ -2051,7 +2106,7 @@ auto tml::NamedSemaphore<num_slots>::lock() -> Result {
 
 template<size_t num_slots>
 auto tml::NamedSemaphore<num_slots>::try_lock() -> Result {
-    if(is_invalid_handle_state(value_)) {
+    if(Lock::is_invalid_handle_state(value_)) {
         return Result::BadCall;
     }
 
@@ -2066,13 +2121,12 @@ auto tml::NamedSemaphore<num_slots>::try_lock() -> Result {
 template<size_t num_slots>
 auto tml::NamedSemaphore<num_slots>::create(const NativeString& name, const bool immediate_lock) -> NamedSemaphore {
     NamedSemaphore<num_slots> sem;
-    const auto full = NativeString(L"Local\\") + name;
-
+    sem.name_  = NativeString(L"Local\\") + name;
     sem.value_ = CreateSemaphoreW(
         nullptr,
         static_cast<LONG>(num_slots),
         static_cast<LONG>(num_slots),
-        full.c_str()
+        sem.name_.c_str()
     );
 
     if(sem.value_ == nullptr || GetLastError() == ERROR_ALREADY_EXISTS) {
@@ -2089,13 +2143,12 @@ auto tml::NamedSemaphore<num_slots>::create(const NativeString& name, const bool
 template<size_t num_slots>
 auto tml::NamedSemaphore<num_slots>::open(const NativeString &name) -> NamedSemaphore {
     NamedSemaphore<num_slots> sem;
-    const auto full = NativeString(L"Local\\") + name;
-
+    sem.name_  = NativeString(L"Local\\") + name;
     sem.value_ = OpenSemaphoreW(  // Call only succeeds if the semaphore exists.
         SEMAPHORE_MODIFY_STATE    // For ReleaseSemaphore.
          | SYNCHRONIZE,           // For WaitForSingleObject.
         FALSE,                    // Do not inherit this handle in child processes.
-        full.c_str()              // Semaphore name (with "Local\" prefix)
+        sem.name_.c_str()         // Semaphore name (with "Local\" prefix)
     );
     return sem;
 }
@@ -2103,13 +2156,12 @@ auto tml::NamedSemaphore<num_slots>::open(const NativeString &name) -> NamedSema
 template<size_t num_slots>
 auto tml::NamedSemaphore<num_slots>::create_or_open(const NativeString &name, const bool immediate_lock) -> NamedSemaphore {
     NamedSemaphore<num_slots> sem;
-    const auto full = NativeString(L"Local\\") + name;
-
+    sem.name_  = NativeString(L"Local\\") + name;
     sem.value_ = CreateSemaphoreW(
         nullptr,
         static_cast<LONG>(num_slots),
         static_cast<LONG>(num_slots),
-        full.c_str()
+        sem.name_.c_str()
     );
 
     if(sem.value_ == nullptr) {
@@ -2123,9 +2175,103 @@ auto tml::NamedSemaphore<num_slots>::create_or_open(const NativeString &name, co
 }
 
 #else // OS == POSIX
-// TODO
 
-#endif
+template<size_t num_slots>
+auto tml::NamedSemaphore<num_slots>::create(const NativeString& name, bool immediate_lock) -> NamedSemaphore {
+    NamedSemaphore<num_slots> sem;
+    sem.name_  = name;
+    sem.value_ = ::sem_open(
+        name.c_str(),                         // Full semaphore name.
+        O_CREAT                               // Create a new semaphoe.
+          | O_EXCL,                           // Fail if a semaphore already exists.
+        S_IRUSR                               // Owner: read permissions
+          | S_IWUSR                           // Owner: write permissions
+          | S_IRGRP                           // Group: read permissions
+          | S_IWGRP,                          // Group: write permissions
+        static_cast<unsigned int>(num_slots)  // Expected type for slots is u32 i think...
+    );
+
+    if(sem.value_ != SEM_FAILED && immediate_lock) {
+        sem.lock();
+    }
+
+    return sem;
+}
+
+template<size_t num_slots>
+auto tml::NamedSemaphore<num_slots>::open(const NativeString& name) -> NamedSemaphore {
+    NamedSemaphore<num_slots> sem;
+    sem.value_ = ::sem_open(name.c_str(), O_RDWR);
+    sem.name_  = name;
+    return sem;
+}
+
+template<size_t num_slots>
+auto tml::NamedSemaphore<num_slots>::create_or_open(const NativeString &name, bool immediate_lock) -> NamedSemaphore {
+    NamedSemaphore<num_slots> sem;
+    sem.name_  = name;
+    sem.value_ = ::sem_open(
+        name.c_str(),
+        O_CREAT,
+        S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP,
+        static_cast<unsigned int>(num_slots)
+    );
+
+    if(sem.value_ != SEM_FAILED && immediate_lock) {
+        sem.lock();
+    }
+
+    return sem;
+}
+
+template<size_t num_slots>
+auto tml::NamedSemaphore<num_slots>::close() -> void {
+    if(Lock::is_invalid_handle_state(value_)) {
+        return;
+    }
+
+    ::sem_close(value_);
+    value_ = Lock::get_invalid_handle_state();
+}
+
+template<size_t num_slots>
+auto tml::NamedSemaphore<num_slots>::destroy() -> void {
+    close();
+    if(!name_.empty()) {
+        ::sem_unlink(name_.c_str());
+    }
+}
+
+template<size_t num_slots>
+auto tml::NamedSemaphore<num_slots>::lock() -> Result {
+    if(Lock::is_invalid_handle_state(value_)) {
+        return Result::BadCall;
+    }
+
+    return sem_wait(value_) == -1
+        ? Result::Error
+        : Result::Acquired;
+}
+
+template<size_t num_slots>
+auto tml::NamedSemaphore<num_slots>::try_lock() -> Result {
+    if(Lock::is_invalid_handle_state(value_)) {
+        return Result::BadCall;
+    }
+    if(sem_trywait(value_) == 0) {
+        return Result::Acquired;
+    }
+
+    return errno == EAGAIN ? Result::Blocked : Result::Error;
+}
+
+template<size_t num_slots>
+auto tml::NamedSemaphore<num_slots>::unlock() -> void {
+    if(!Lock::is_invalid_handle_state(value_))
+        sem_post(value_);
+}
+
+#endif // #if defined(TML_WINDOWS)
 
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -2330,6 +2476,8 @@ tml::SharedRegion::_create_impl(
     ////////////////////////////////////////////////////////////////////////////////////////////////
     // Create shared memory object.
 
+    sr.name_   = full;
+    sr.size_   = length;
     sr.handle_ = CreateFileMappingW(
         INVALID_HANDLE_VALUE,                                   // Indicates that we are creating this object from the pagefile.
         nullptr,                                                // attributes. Optional.
@@ -2410,7 +2558,176 @@ tml::SharedRegion::create_or_open(const NativeString &name, const size_t max_len
 }
 
 #else  // OS == POSIX
-//TODO
+
+TML_ATTR_FORCEINLINE
+auto tml::SharedRegion::get_invalid_region_handle() -> RegionHandle {
+    return -1;
+}
+
+TML_ATTR_FORCEINLINE
+auto tml::SharedRegion::is_invalid_region_handle(const RegionHandle h) -> bool {
+    return h == get_invalid_region_handle();
+}
+
+inline tml::SharedRegion
+tml::SharedRegion::open(const NativeString& name, const size_t length) {
+    SharedRegion sr;
+    sr.name_   = name;
+    sr.size_   = length;
+    sr.handle_ = ::shm_open(name.c_str(), O_RDWR, 0);
+
+    if(sr.handle_ == -1) {
+        return sr;
+    }
+
+    struct stat statbuff = { 0 };
+    if(::fstat(sr.handle_, &statbuff) == -1) {
+        ::close(sr.handle_);
+        sr.handle_ = -1;
+    }
+
+    if(sr.size_ == 0) {
+        sr.size_ = static_cast<size_t>(statbuff.st_size);
+    }
+
+    sr.addr_ = ::mmap(
+        nullptr,
+        sr.size_,
+        PROT_READ | PROT_WRITE,
+        MAP_SHARED,
+        sr.handle_,
+        0
+    );
+
+    if(sr.addr_ == MAP_FAILED) {
+        ::close(sr.handle_);
+        sr.handle_ = -1;
+        sr.addr_   = nullptr;
+    }
+
+    return sr;
+}
+
+inline tml::SharedRegion
+tml::SharedRegion::_create_impl(
+    const NativeString& name,
+    const size_t max_length,
+    const bool open_if_exists,
+    const size_t length
+) {
+    constexpr int oflags = O_CREAT | O_RDWR;
+    constexpr int mflags = S_IRUSR | S_IWUSR;
+    struct stat statbuff = { 0 };
+    SharedRegion sr;
+
+    sr.name_ = name;
+    sr.size_ = length;
+    if(max_length == 0) {
+        errno = EINVAL;
+        return sr;
+    }
+
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+    // Small helper lambdas for cleanup purposes.
+
+    auto close_sr = [&] {
+        ::close(sr.handle_);
+        sr.handle_ = -1;
+    };
+
+    auto unlink_sr = [&] {
+        ::shm_unlink(sr.name_.c_str());
+        sr.name_.clear();
+    };
+
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+    // Open a new or existing shared memory object.
+
+    sr.handle_ = ::shm_open(
+        name.c_str(),
+        !open_if_exists ? oflags | O_EXCL : oflags,
+        mflags
+    );
+
+    if(sr.handle_ == -1) {
+        return sr;
+    }
+
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+    // If the object is newly created, i.e. it didn't exist before our call to
+    // shm_open(), we'll need to set the size of the object to max_length via ftruncate()
+
+    if(::fstat(sr.handle_, &statbuff) == -1) {
+        close_sr();
+        return sr;
+    }
+
+    if(open_if_exists == false
+        && statbuff.st_size == 0
+        && ::ftruncate(sr.handle_, static_cast<off_t>(max_length) == -1
+    )) {
+        close_sr();
+        return sr;
+    }
+
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+    // Finally, map the object into this process' address space via mmap().
+
+    if(::fstat(sr.handle_, &statbuff) == -1) {
+        close_sr();
+        return sr;
+    } if(sr.size_ == 0) {
+        sr.size_ = static_cast<size_t>(statbuff.st_size);
+    }
+
+    sr.addr_ = ::mmap(
+        nullptr,                 // Preferred base address. Not needed here.
+        sr.size_,                // Length of the mapped region.
+        PROT_READ | PROT_WRITE,  // Memory protection. Always R/W.
+        MAP_SHARED,              // Changes to the region are shared across processes.
+        sr.handle_,              // Shared memory object fd.
+        0                        // Offset from start of the object. Not needed here.
+    );
+
+    if(sr.addr_ == MAP_FAILED) {
+        sr.addr_ = nullptr;
+        close_sr();
+        if(!open_if_exists) {
+            unlink_sr();
+        }
+    }
+
+    return sr;
+}
+
+inline tml::SharedRegion
+tml::SharedRegion::create(const NativeString &name, const size_t max_length, const size_t length) {
+    return _create_impl(name, max_length, false, length);
+}
+
+inline tml::SharedRegion
+tml::SharedRegion::create_or_open(const NativeString &name, const size_t max_length, const size_t length) {
+    return _create_impl(name, max_length, true, length);
+}
+
+inline void
+tml::SharedRegion::close() {
+    if(addr_ != nullptr) ::munmap(addr_, size_);
+    if(handle_ != -1)    ::close(handle_);
+
+    addr_   = nullptr;
+    handle_ = -1;
+}
+
+inline void
+tml::SharedRegion::destroy() {
+    close();
+    if(!name_.empty()) {
+        ::shm_unlink(name_.c_str());
+        name_.clear();
+    }
+}
+
 #endif // #if defined(TML_WINDOWS)
 
 
@@ -2574,33 +2891,33 @@ tml::Process::Process(Process&& other) noexcept
     other.handle_.invalidate();
 }
 
-[[nodiscard]] TML_ATTR_FORCEINLINE const std::vector<tml::NativeString>&
+[[nodiscard]] inline const std::vector<tml::NativeString>&
 tml::Process::get_arguments() const {
     return arguments_;
 }
 
-[[nodiscard]] TML_ATTR_FORCEINLINE const tml::NativeString&
+[[nodiscard]] inline const tml::NativeString&
 tml::Process::get_name() const {
     return name_;
 }
 
-[[nodiscard]] TML_ATTR_FORCEINLINE const tml::NativeString&
+[[nodiscard]] inline const tml::NativeString&
 tml::Process::get_working_directory() const {
     return working_directory_;
 }
 
-[[nodiscard]] TML_ATTR_FORCEINLINE bool
+[[nodiscard]] inline bool
 tml::Process::launched() const {
     return !Handle::is_invalid_handle_state(handle_);
 }
 
-TML_ATTR_FORCEINLINE tml::Process&
+inline tml::Process&
 tml::Process::args(const std::vector<NativeString>& arg_list) {
     arguments_ = arg_list;
     return *this;
 }
 
-TML_ATTR_FORCEINLINE tml::Process&
+inline tml::Process&
 tml::Process::args(std::vector<NativeString>&& arg_list) {
     arguments_ = arg_list;
     return *this;
@@ -2634,7 +2951,7 @@ auto tml::Process::buffer_redirect(const size_t buff_size, T callback) -> Proces
     return *this;
 }
 
-TML_ATTR_FORCEINLINE tml::Process&
+inline tml::Process&
 tml::Process::file_redirect(const NativeString& file_name, const bool append_contents) {
     if(    !std::holds_alternative<std::monostate>(output_)
         || !std::holds_alternative<std::monostate>(output_callback_)) {
@@ -2645,7 +2962,7 @@ tml::Process::file_redirect(const NativeString& file_name, const bool append_con
     return *this;
 }
 
-TML_ATTR_FORCEINLINE tml::Process&
+inline tml::Process&
 tml::Process::on_exit(OnExitCallback callback) {
     if(!std::holds_alternative<std::monostate>(exit_callback_)) {
         return *this;
@@ -2657,7 +2974,6 @@ tml::Process::on_exit(OnExitCallback callback) {
 
 
 #if defined(TML_WINDOWS)
-// TODO: launch, exit wait and output impl
 
 TML_ATTR_FORCEINLINE tml::ExitCode
 tml::Process::get_exit_code() {
@@ -2902,7 +3218,6 @@ tml::Process::~Process() {
     handle_.kill();
 }
 
-
 #else // OS == POSIX
 
 [[noreturn]] inline void
@@ -2937,8 +3252,8 @@ tml::Process::_posix_child_launch_impl() {
         chdir(working_directory_.c_str());            // Not worth error checking this frankly.
     }
 
-    execvp(name_.c_str(), argv.data());               // Replace child process' image.
-    exit(420);                                        // This call is uncreachable if execvp succeeds.
+    ::execvp(name_.c_str(), argv.data());               // Replace child process' image.
+    ::exit(420);                                        // This call is uncreachable if execvp succeeds.
 }
 
 inline void
@@ -3139,7 +3454,7 @@ tml::Process::get_exit_code() {
 
 inline tml::Process&
 tml::Process::launch() {
-    const auto pid = fork();                          // Call fork() to spawn a child.
+    const auto pid = ::fork();                          // Call fork() to spawn a child.
     if(pid < 0) {                                     // < 0 indicates failure.
         throw TMLException::ProcessLaunchException();
     }

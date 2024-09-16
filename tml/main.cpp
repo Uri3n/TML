@@ -1,24 +1,16 @@
 #include "tml.hpp"
-#include <mutex>
 
 using namespace tml;
 int main() {
 
-    /*auto pipe = NamedPipe::create(ns("MyPipe"));
-    if(!pipe.is_open()) {
-        std::cerr << "failed to open pipe: " << ::last_system_error() << std::endl;
+    try {
+        tml::spawn(ns("ls"), { ns("-l"), ns("--color=always") }, ns("/Users/Diago/Desktop"));
+    }
+    catch(const TMLException& e) {
+        std::cerr << "exception: " << e.what() << '\n';
         return 1;
     }
 
-    std::cout << "Beginning read...\n";
-    pipe.on_receive([](const std::vector<uint8_t>& buffer) {
-        std::cout << "Received message from the pipe:\n";
-        std::cout.write((const char*)buffer.data(), buffer.size());
-        std::cout.flush();
-    });
-
-    Sleep(2);
-    std::cout << "calling destroy\n";
-    pipe.destroy();*/
+    sleep(3);
     return 0;
 }
