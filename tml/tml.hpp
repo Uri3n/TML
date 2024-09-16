@@ -58,6 +58,7 @@
 #include <iostream>
 #include <exception>
 #include <filesystem>
+#include <cstdint>
 #include <thread>
 #include <functional>
 #include <utility>
@@ -66,14 +67,14 @@
 #include <array>
 #include <chrono>
 
+static_assert(sizeof(size_t) == 8,   "Only modern 64-bit architectures are allowed.");
+static_assert(sizeof(unsigned) == 4, "Only modern 64-bit architectures are allowed.");
 
 namespace tml {
     class Process;
-    class Group;
     class OutputDevice;
     class Handle;
     class TMLException;
-    class DeferredAction;
     class NamedPipe;
     class SharedRegion;
     class AlignedFlatBuffer;
@@ -100,6 +101,9 @@ namespace tml {
     template<size_t>
     class NamedSemaphore;
 
+    template<typename T> requires std::is_invocable_v<T>
+    class ScopedAction;
+
     template<tml::Lockable T>
     class LockGuard;
 
@@ -116,6 +120,7 @@ namespace tml {
 
 namespace tml {
     std::string last_system_error();
+    void spawn(const NativeString& name, const std::vector<NativeString>& args = {}, const NativeString& wd = ns(""));
     [[noreturn]] void _panic_impl(const std::string& file, int line, const std::string& msg = "");
 }
 
@@ -134,23 +139,25 @@ namespace tml::this_process {
 // - Calls the invocable object when the destructor is invoked.
 // - Comes with two macros, tml_defer, and tml_defer_if to make using the class cleaner.
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-class tml::DeferredAction {
-    std::function<void()> action_;
-    bool condition_       = false;
-    bool using_condition_ = false;
+template<typename T> requires std::is_invocable_v<T>
+class tml::ScopedAction {
+    T action_;
 public:
-    ~DeferredAction() { action_(); }
+    ~ScopedAction() { action_(); }
 
-    explicit DeferredAction(decltype(action_)  action)
-        : action_(std::move(action)) {}
-    explicit DeferredAction(const bool condition, decltype(action_)  action)
-        : action_(std::move(action)),
-        condition_(condition),
-        using_condition_(true) {}
+    ScopedAction(const ScopedAction&)             = delete;
+    ScopedAction& operator=(const ScopedAction&)  = delete;
+    ScopedAction(const ScopedAction&&)            = delete;
+    ScopedAction& operator=(const ScopedAction&&) = delete;
+
+    explicit ScopedAction(const T action) : action_(action) {}
 };
 
-#define tml_defer(action)               auto _ = tml::DeferredAction(action);
-#define tml_defer_if(condition, action) auto _ = tml::DeferredAction(condition, action);
+#define tml_defer(action)               auto _ = tml::ScopedAction(action);
+#define tml_defer_if(condition, action) \
+auto _ = tml::ScopedAction([&](){       \
+    if((condition)) action();           \
+});                                     \
 
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -192,17 +199,17 @@ public:
 
     void close();
     void invalidate();
-    void kill()  const;
+    void kill() const;
     [[nodiscard]] ExitCode get_exit_code()  const noexcept;
-    [[nodiscard]] Value get() const noexcept;
+    [[nodiscard]] Value get()               const noexcept;
 
     static bool is_invalid_handle_state(const Handle& handle);
     static bool is_invalid_handle_state(Value value);
     static Value get_invalid_handle_state();
 
-    bool operator==(const Handle& other)       const noexcept;
+    bool operator==(const Handle& other) const noexcept;
     bool operator==(Handle::Value other) const noexcept;
-    bool operator!=(const Handle& other)       const noexcept;
+    bool operator!=(const Handle& other) const noexcept;
     bool operator!=(Handle::Value other) const noexcept;
 
     ~Handle() = default;
@@ -270,14 +277,14 @@ public:
 
     static auto get_invalid_handle_state()                         -> Value;
     static auto is_invalid_handle_state(Value value)               -> bool;
-    static auto create(Value val, Type type)                       -> OutputDevice;
+    static auto open_file(const NativeString& name, bool append)   -> OutputDevice;
     static auto create_file(const NativeString& name, bool append) -> OutputDevice;
     static auto create_pipe()                                      -> AnonymousPipe;
 
-    bool operator==(const OutputDevice& other)       const noexcept;
-    bool operator==(const OutputDevice::Value other) const noexcept;
-    bool operator!=(const OutputDevice& other)       const noexcept;
-    bool operator!=(const OutputDevice::Value other) const noexcept;
+    bool operator==(const OutputDevice& other) const noexcept;
+    bool operator==(OutputDevice::Value other) const noexcept;
+    bool operator!=(const OutputDevice& other) const noexcept;
+    bool operator!=(OutputDevice::Value other) const noexcept;
 
     ~OutputDevice() = default;
     OutputDevice() : value_(get_invalid_handle_state()) {}
@@ -334,13 +341,53 @@ protected:
 
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+// ~ tml::SharedRegion ~
+// - A flat, anonymous region of virtual memory that is shared across processes.
+// - Can be written to and read from by all processes that have the region open.
+////////////////////////////////////////////////////////////////////////////////////////////////////
+class tml::SharedRegion {
+public:
+#if defined(TML_WINDOWS)
+    using RegionHandle = ::HANDLE;
+#else
+    using RegionHandle = int;
+#endif
+
+    template<typename T = void*>
+    T get();
+    const NativeString& name();
+    void destroy();
+    void close();
+    [[nodiscard]] size_t size() const;
+    [[nodiscard]] bool is_open() const;
+
+    static bool         is_invalid_region_handle(RegionHandle h);
+    static RegionHandle get_invalid_region_handle();
+    static SharedRegion create(const NativeString& name, size_t max_length, size_t length = 0);
+    static SharedRegion create_or_open(const NativeString& name, size_t max_length, size_t length = 0);
+    static SharedRegion open(const NativeString& name, size_t length = 0);
+
+    ~SharedRegion() = default;
+private:
+    static SharedRegion _create_impl(const NativeString&, size_t, bool open_if_exists, size_t);
+    SharedRegion() : handle_(get_invalid_region_handle()) {}
+
+    void*  addr_ = nullptr;
+    size_t size_ = 0;
+    RegionHandle handle_;
+    NativeString name_;
+};
+
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
 // ~ tml::NamedSemaphore ~
 // - An object that can be "locked" across different processes.
 // - Constructor specifies the amount of processes that can lock the semaphore at once.
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 template<size_t num_slots>
 class tml::NamedSemaphore final : public tml::Lock {
-    static_assert(num_slots > 0, "Number of semaphore slots must be greater than 0.");
+    static_assert(num_slots > 0);
+    static_assert(num_slots < (std::numeric_limits<long>::max)());
 public:
 
     Result lock()     override;
@@ -350,7 +397,11 @@ public:
     void destroy()    override;
     void close()      override;
 
-    NamedSemaphore() = default;
+    static NamedSemaphore create(const NativeString& name, bool immediate_lock = false);
+    static NamedSemaphore open(const NativeString& name);
+    static NamedSemaphore create_or_open(const NativeString& name, bool immediate_lock = false);
+
+    NamedSemaphore()           = default;
     ~NamedSemaphore() override = default;
 };
 
@@ -389,9 +440,9 @@ private:
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // ~ tml::LockGuard ~
 // - RAII wrapper around lockable IPC mechanisms.
-// - Very similar to std::lock_guard
+// - Very similar to std::lock_guard.
+// - the constructor locks the IPC primitive, and the destructor unlocks it.
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-
 template<tml::Lockable T>
 class tml::LockGuard {
 public:
@@ -503,7 +554,6 @@ private:
 };
 
 
-
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // ~ tml::Process ~
 // - class that represents a child process
@@ -514,9 +564,6 @@ private:
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 class tml::Process {
 public:
-    ///////////////////////////////////////////////////////////////////////////////////////
-    // Public methods
-
     Process(const Process&) = delete;
     Process& operator=(const Process&) = delete;
     Process(Process&&) noexcept;
@@ -541,9 +588,6 @@ public:
     template<typename T> requires tml::BufferCallback<T>
     Process& buffer_redirect(size_t buff_size, T callback);
 
-    ///////////////////////////////////////////////////////////////////////////////////////
-    // non-move constructor, destructor
-
     ~Process();
     explicit Process(NativeString name)
     : handle_(Handle::get_invalid_handle_state()),
@@ -556,9 +600,6 @@ public:
       output_callback_(std::monostate()),
       exit_callback_(std::monostate()){}
 
-    ///////////////////////////////////////////////////////////////////////////////////////
-    // Things we need to do post-launch
-
 private:
 #if defined(TML_MACOS) || defined(TML_LINUX)
     [[noreturn]] void _posix_child_launch_impl();
@@ -569,9 +610,6 @@ private:
     static void _launch_pipe_aligned_read_impl(OutputDevice::Value, AlignedBufferCallback, size_t);
     static void _launch_pipe_dyn_read_impl(OutputDevice::Value, DynamicBufferCallback, size_t);
     static void _launch_exit_wait_impl(Handle child_handle, OnExitCallback cb);
-
-    ///////////////////////////////////////////////////////////////////////////////////////
-    // Private members
 
     Handle handle_;
     NativeString name_;
@@ -630,12 +668,12 @@ tml::this_process::kill(const int status) {
 
 [[nodiscard]] inline tml::OutputDevice
 tml::this_process::out() {
-    return OutputDevice(GetStdHandle(STD_OUTPUT_HANDLE));
+    return GetStdHandle(STD_OUTPUT_HANDLE);
 }
 
 [[nodiscard]] inline tml::OutputDevice
 tml::this_process::err() {
-    return OutputDevice(GetStdHandle(STD_ERROR_HANDLE));
+    return GetStdHandle(STD_ERROR_HANDLE);
 }
 
 TML_ATTR_FORCEINLINE size_t
@@ -658,7 +696,6 @@ tml::last_system_error() {
         return "";
     }
 
-    // Documentation: https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-formatmessagea
     result = FormatMessageA(
         FORMAT_MESSAGE_ALLOCATE_BUFFER              // Specifies that a buffer should be allocated for the message.
             | FORMAT_MESSAGE_FROM_SYSTEM            // Indicates that the system message table should be searched.
@@ -680,11 +717,75 @@ tml::last_system_error() {
     return out;
 }
 
+inline void
+tml::spawn(const NativeString& name, const std::vector<NativeString>& args, const NativeString& wd) {
+
+    //
+    // if "name" or any string in "args" is empty,
+    // we should reject this call right away.
+    //
+
+    if(std::ranges::find_if(args, [](const NativeString& arg) {
+        return arg.empty();
+    }) != args.end() || name.empty()) {
+        SetLastError(ERROR_BAD_ARGUMENTS);
+        throw TMLException::ProcessLaunchException();
+    }
+
+    const auto full = [&]() -> NativeString {
+        NativeString full_ = name;
+        for(const auto& arg : args) {
+            full_ += ' ';
+            full_ += arg;
+        }
+    }();
+
+    //
+    // Copy into a new temp buffer. See the Windows version of
+    // tml::Process::launch() to see why we need to do this.
+    //
+
+    auto* tmp_arg_buff = new wchar_t[full.size() + 1];
+    tml_defer([tmp_arg_buff] {
+        delete[] tmp_arg_buff;
+    });
+
+    memcpy(tmp_arg_buff, full.data(), full.size());
+    tmp_arg_buff[full.size()] = L'\0';
+
+    //
+    // Call CreateProcessW to spawn a child.
+    //
+
+    PROCESS_INFORMATION proc_info = { 0 };
+    STARTUPINFOW        startup   = { 0 };
+    startup.cb = sizeof(startup);
+    if(!CreateProcessW(
+        nullptr,
+        tmp_arg_buff,
+        nullptr,
+        nullptr,
+        FALSE,
+        0,
+        nullptr,
+        wd.empty() ? nullptr : wd.c_str(),
+        &startup,
+        &proc_info
+    )) {
+        throw TMLException::ProcessLaunchException();
+    }
+
+    CloseHandle(proc_info.hThread);
+    CloseHandle(proc_info.hProcess);
+}
+
+
 #else // OS == POSIX
 
 [[noreturn]] TML_ATTR_FORCEINLINE void
 tml::this_process::kill(const int status) {
-    _exit(status); // NOT the same as C's exit()
+    // this is NOT the same as C's exit(). Check man7 for more info.
+    _exit(status);
 }
 
 [[nodiscard]] inline tml::OutputDevice
@@ -806,7 +907,6 @@ tml::NamedPipe::create(const NativeString &name, const AccessType access) noexce
         }
     }();
 
-    // https://learn.microsoft.com/en-us/windows/win32/api/namedpipeapi/nf-namedpipeapi-createnamedpipew
     pipe.handle_ = CreateNamedPipeW(
         full.c_str(),                    // Name of the pipe, must follow the "\\.\pipe\<NAME>" format
         flags,                           // Access modifier for this pipe (read/write/duplex)
@@ -1584,14 +1684,6 @@ tml::OutputDevice::invalidate() {
     type_  = Type::None;
 }
 
-inline tml::OutputDevice
-tml::OutputDevice::create(const Value val, const Type type) {
-    OutputDevice device;
-    device.value_ = val;
-    device.type_  = type;
-    return device;
-}
-
 [[nodiscard]] inline tml::OutputDevice::Value
 tml::OutputDevice::value() const {
     return value_;
@@ -1656,7 +1748,6 @@ tml::OutputDevice::create_file(const NativeString& name, const bool append) {
         flags |= FILE_APPEND_DATA;
     }
 
-    // Documentation: https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilea
     device.type_  = Type::File;
     device.value_ = CreateFileW(
         name.c_str(),                        // Name of the file.
@@ -1676,6 +1767,36 @@ tml::OutputDevice::create_file(const NativeString& name, const bool append) {
 
     // Opening a file in append mode on Windows does not move
     // the file pointer to the end of the file. We need to do it here if need be.
+    if(append) {
+        SetFilePointer(device.value_, 0, nullptr, FILE_END);
+    }
+
+    return device;
+}
+
+inline auto
+tml::OutputDevice::open_file(const NativeString &name, const bool append) -> OutputDevice {
+    OutputDevice device;
+    DWORD flags = FILE_GENERIC_READ | FILE_GENERIC_WRITE;
+    if(append) {
+        flags |= FILE_APPEND_DATA;
+    }
+
+    device.type_  = Type::File;
+    device.value_ = CreateFileW(
+        name.c_str(),
+        flags,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        nullptr,
+        OPEN_EXISTING,
+        0,
+        nullptr
+    );
+
+    if(device.value_ == INVALID_HANDLE_VALUE) {
+        throw TMLException::OutputDeviceCreationException();
+    }
+
     if(append) {
         SetFilePointer(device.value_, 0, nullptr, FILE_END);
     }
@@ -1720,6 +1841,23 @@ inline tml::OutputDevice
 tml::OutputDevice::create_file(const NativeString& name, const bool append) {
     OutputDevice device;
     int flags = O_RDWR | O_CREAT;
+    if(append) {
+        flags |= O_APPEND;
+    }
+
+    device.type_  = Type::File;
+    device.value_ = ::open(name.c_str(), flags, 0644);
+    if(device.value_ == -1) {
+        throw TMLException::OutputDeviceCreationException();
+    }
+
+    return device;
+}
+
+inline auto
+tml::OutputDevice::open_file(const NativeString &name, const bool append) -> OutputDevice {
+    OutputDevice device;
+    int flags = O_RDWR;
     if(append) {
         flags |= O_APPEND;
     }
@@ -1855,6 +1993,142 @@ auto tml::LockGuard<T>::has_lock() const -> bool {
 
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+// ~ Begin tml::NamedSemaphore methods. ~
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#if defined(TML_WINDOWS)
+
+template<size_t num_slots>
+auto tml::NamedSemaphore<num_slots>::close() -> void {
+    if(is_invalid_handle_state(value_)) {
+        return;
+    }
+
+    CloseHandle(value_);
+    value_ = get_invalid_handle_state();
+}
+
+template<size_t num_slots>
+auto tml::NamedSemaphore<num_slots>::destroy() -> void {
+    close();
+}
+
+template<size_t num_slots>
+auto tml::NamedSemaphore<num_slots>::is_valid() -> bool {
+    return Lock::is_invalid_handle_state(value_);
+}
+
+template<size_t num_slots>
+auto tml::NamedSemaphore<num_slots>::unlock() -> void {
+    if(is_invalid_handle_state(value_)) {
+        return;
+    }
+
+    ReleaseSemaphore(value_, 1, nullptr);
+}
+
+/* NOTE (Windows):
+ * NamedSemaphore::lock() and try_lock() are essentially
+ * identical to NamedMutex::lock() because the way you lock them
+ * using win32 is identical. This is kind of lazy, and I could
+ * implement some templated solution for this, or have these functions
+ * exist in the base class instead, but I think that would mess with the POSIX
+ * side of things. Keeping it this way for now.
+ */
+
+template<size_t num_slots>
+auto tml::NamedSemaphore<num_slots>::lock() -> Result {
+    if(is_invalid_handle_state(value_)) {
+        return Result::BadCall;
+    }
+
+    switch(WaitForSingleObject(value_, INFINITE)) {
+        case WAIT_OBJECT_0:  return Result::Acquired;
+        case WAIT_ABANDONED: return Result::Abandoned;
+        default:             return Result::Error;
+    }
+}
+
+template<size_t num_slots>
+auto tml::NamedSemaphore<num_slots>::try_lock() -> Result {
+    if(is_invalid_handle_state(value_)) {
+        return Result::BadCall;
+    }
+
+    switch(WaitForSingleObject(value_, 0)) {
+        case WAIT_OBJECT_0:  return Result::Acquired;
+        case WAIT_TIMEOUT:   return Result::Blocked;
+        case WAIT_ABANDONED: return Result::Abandoned;
+        default:             return Result::Error;
+    }
+}
+
+template<size_t num_slots>
+auto tml::NamedSemaphore<num_slots>::create(const NativeString& name, const bool immediate_lock) -> NamedSemaphore {
+    NamedSemaphore<num_slots> sem;
+    const auto full = NativeString(L"Local\\") + name;
+
+    sem.value_ = CreateSemaphoreW(
+        nullptr,
+        static_cast<LONG>(num_slots),
+        static_cast<LONG>(num_slots),
+        full.c_str()
+    );
+
+    if(sem.value_ == nullptr || GetLastError() == ERROR_ALREADY_EXISTS) {
+        sem.close();
+        return sem;
+    }
+    if(immediate_lock && WaitForSingleObject(sem.value_, INFINITE) != WAIT_OBJECT_0) {
+        sem.close();
+    }
+
+    return sem;
+}
+
+template<size_t num_slots>
+auto tml::NamedSemaphore<num_slots>::open(const NativeString &name) -> NamedSemaphore {
+    NamedSemaphore<num_slots> sem;
+    const auto full = NativeString(L"Local\\") + name;
+
+    sem.value_ = OpenSemaphoreW(  // Call only succeeds if the semaphore exists.
+        SEMAPHORE_MODIFY_STATE    // For ReleaseSemaphore.
+         | SYNCHRONIZE,           // For WaitForSingleObject.
+        FALSE,                    // Do not inherit this handle in child processes.
+        full.c_str()              // Semaphore name (with "Local\" prefix)
+    );
+    return sem;
+}
+
+template<size_t num_slots>
+auto tml::NamedSemaphore<num_slots>::create_or_open(const NativeString &name, const bool immediate_lock) -> NamedSemaphore {
+    NamedSemaphore<num_slots> sem;
+    const auto full = NativeString(L"Local\\") + name;
+
+    sem.value_ = CreateSemaphoreW(
+        nullptr,
+        static_cast<LONG>(num_slots),
+        static_cast<LONG>(num_slots),
+        full.c_str()
+    );
+
+    if(sem.value_ == nullptr) {
+        return sem;
+    }
+    if(immediate_lock && WaitForSingleObject(sem.value_, INFINITE) != WAIT_OBJECT_0) {
+        sem.close();
+    }
+
+    return sem;
+}
+
+#else // OS == POSIX
+// TODO
+
+#endif
+
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
 // ~ Begin tml::NamedMutex methods. ~
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -1910,7 +2184,7 @@ tml::NamedMutex::unlock() {
 
 TML_ATTR_FORCEINLINE void
 tml::NamedMutex::close() {
-    if(!is_invalid_handle_state(value_)) {
+    if(!Lock::is_invalid_handle_state(value_)) {
         CloseHandle(value_);
         value_ = get_invalid_handle_state();
     }
@@ -1918,7 +2192,7 @@ tml::NamedMutex::close() {
 
 TML_ATTR_FORCEINLINE bool
 tml::NamedMutex::is_valid() {
-    return is_invalid_handle_state(value_);
+    return Lock::is_invalid_handle_state(value_);
 }
 
 TML_ATTR_FORCEINLINE void
@@ -1935,31 +2209,24 @@ tml::NamedMutex::create(const NativeString& name, const bool immediate_lock) {
         name.c_str()
     );
 
-    if(mtx.value_ == nullptr) {
-        return mtx;
-    } if(GetLastError() == ERROR_ALREADY_EXISTS) {
+    if(GetLastError() == ERROR_ALREADY_EXISTS) {
+        if(immediate_lock) mtx.unlock();
         mtx.close();
-        return mtx;
     }
-
     return mtx;
 }
 
 inline tml::NamedMutex
 tml::NamedMutex::open(const NativeString &name) {
-    SetLastError(ERROR_SUCCESS);
-
     NamedMutex mtx;
-    mtx.value_ = CreateMutexW(nullptr, FALSE, name.c_str());
+    const auto full = NativeString(L"Local\\") + name;
 
-    if(mtx.value_ == nullptr) {
-        return mtx;
-    } if(GetLastError() != ERROR_ALREADY_EXISTS) {
-        mtx.close();
-        return mtx;
-    }
-
-    SetLastError(ERROR_SUCCESS);
+    mtx.value_ = OpenMutexW(  // Call only succeeds if the mutex exists.
+        MUTEX_MODIFY_STATE    // For WaitForSingleObject.
+         | SYNCHRONIZE,       // For ReleaseMutex.
+        FALSE,                // Child processes do not inherit this mutex handle.
+        full.c_str()          // Full name of the mutex.
+    );
     return mtx;
 }
 
@@ -1975,8 +2242,177 @@ tml::NamedMutex::create_or_open(const NativeString &name, const bool immediate_l
     return mtx;
 }
 
+#endif // #if defined(TML_WINDOWS)
 
-#endif
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// ~ Begin tml::SharedRegion methods. ~
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template<typename T>
+auto tml::SharedRegion::get() -> T {
+    constexpr bool is_valid_ptr = std::is_pointer_v<T>;
+    constexpr bool is_void_ptr  = std::is_same_v<T, void*>;
+    static_assert(is_valid_ptr || is_void_ptr, "T must be a valid pointer type.");
+    return reinterpret_cast<T>(addr_);
+}
+
+inline bool
+tml::SharedRegion::is_open() const {
+    return !is_invalid_region_handle(handle_) && addr_ != nullptr;
+}
+
+inline size_t
+tml::SharedRegion::size() const {
+    return size_;
+}
+
+inline const tml::NativeString&
+tml::SharedRegion::name() {
+    return name_;
+}
+
+
+#if defined(TML_WINDOWS)
+
+TML_ATTR_FORCEINLINE
+auto tml::SharedRegion::get_invalid_region_handle() -> RegionHandle {
+    return nullptr;
+}
+
+TML_ATTR_FORCEINLINE
+auto tml::SharedRegion::is_invalid_region_handle(const RegionHandle h) -> bool {
+    return h == get_invalid_region_handle();
+}
+
+inline void
+tml::SharedRegion::close() {
+    if(addr_   != nullptr) UnmapViewOfFile(addr_);
+    if(handle_ != nullptr) CloseHandle(handle_);
+    addr_   = nullptr;
+    handle_ = nullptr;
+}
+
+inline void
+tml::SharedRegion::destroy() {
+    /* On Windows, there is no way to
+     * manually destroy a file mapping object.
+     * These objects are destroyed once their reference count
+     * reaches zero. That is, when the last process
+     * that has opened a handle to that object closes it.
+     * This differs on POSIX systems where you can call
+     * unlink() to delete the underlying file.
+    */
+    close();
+}
+
+inline tml::SharedRegion
+tml::SharedRegion::_create_impl(
+    const NativeString& name,
+    const size_t max_length,
+    const bool open_if_exists,
+    const size_t length
+) {
+    auto sr         = SharedRegion();
+    bool state      = false;
+    const auto full = NativeString(L"Local\\") + name;
+
+    if(max_length == 0) {
+        SetLastError(ERROR_BAD_ARGUMENTS);
+        return sr;
+    }
+
+    tml_defer_if(!state && sr.handle_ != nullptr, [&] {
+      CloseHandle(sr.handle_);
+      sr.handle_ = nullptr;
+    });
+
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+    // Create shared memory object.
+
+    sr.handle_ = CreateFileMappingW(
+        INVALID_HANDLE_VALUE,                                   // Indicates that we are creating this object from the pagefile.
+        nullptr,                                                // attributes. Optional.
+        PAGE_READWRITE,                                         // memory permissions for the object. R/W.
+        static_cast<DWORD>((max_length >> 32) & 0xFFFFFFFFU),   // high order 32 bits of the object's maximum size.
+        static_cast<DWORD>(max_length & 0xFFFFFFFFU),           // low order 32 bits of the object's maximum size.
+        full.c_str()                                            // name of the object.
+    );
+
+    if(sr.handle_ == nullptr || (GetLastError() == ERROR_ALREADY_EXISTS && !open_if_exists)) {
+        return sr;
+    }
+
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+    // Map a "view" of the object into this process' address space.
+
+    if(sr.addr_ = MapViewOfFile(
+        sr.handle_,               // Object handle
+        FILE_MAP_ALL_ACCESS,      // Indicates we want a read/write view.
+        0,                        // high order view offset. Not relevant.
+        0,                        // low order view offset. Not relevant.
+        length                    // how many bytes to map. If 0, maps the whole thing.
+    ); sr.addr_ != nullptr) {
+        state = true;
+    }
+
+    return sr;
+}
+
+inline tml::SharedRegion
+tml::SharedRegion::open(const NativeString &name, const size_t length) {
+    auto sr         = SharedRegion();
+    bool state      = false;
+    const auto full = NativeString(L"Local\\") + name;
+
+    tml_defer_if(!state && sr.handle_ != nullptr, [&] {
+        CloseHandle(sr.handle_);
+        sr.handle_ = nullptr;
+    });
+
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+    // Open the existing shared memory object.
+
+    sr.handle_ = OpenFileMappingW(
+        FILE_MAP_ALL_ACCESS,        // Why do we need to specify this? MapViewOfFile already requires this...
+        FALSE,                      // Do not inherit this handle in child processes.
+        full.c_str()                // Object name, prefixed with Local\.
+    );
+
+    if(sr.handle_ == nullptr) {
+        return sr;
+    }
+
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+    // Map a view of the object into this process' address space.
+
+    if(sr.addr_ = MapViewOfFile(
+        sr.handle_,
+        FILE_MAP_ALL_ACCESS,
+        0,
+        0,
+        length
+    ); sr.addr_ != nullptr) {
+        state = true;
+    }
+
+    return sr;
+}
+
+TML_ATTR_FORCEINLINE tml::SharedRegion
+tml::SharedRegion::create(const NativeString& name, const size_t max_length, const size_t length) {
+    return _create_impl(name, max_length, false, length);
+}
+
+TML_ATTR_FORCEINLINE tml::SharedRegion
+tml::SharedRegion::create_or_open(const NativeString &name, const size_t max_length, const size_t length) {
+    return _create_impl(name, max_length, true, length);
+}
+
+#else  // OS == POSIX
+//TODO
+#endif // #if defined(TML_WINDOWS)
+
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // ~ Begin tml::AlignedFlatBuffer methods. ~
@@ -2019,7 +2455,6 @@ tml::AlignedFlatBuffer::size() const {
 
 inline
 tml::AlignedFlatBuffer::AlignedFlatBuffer (const size_t non_aligned_size) {
-    // https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-virtualalloc
     buffer_ = VirtualAlloc(
         nullptr,                   // optional address to allocate at.
         non_aligned_size,          // size of memory before alignment.
@@ -2048,7 +2483,6 @@ tml::AlignedFlatBuffer::destroy() noexcept {
 
 inline
 tml::AlignedFlatBuffer::AlignedFlatBuffer(const size_t non_aligned_size) {
-    // https://pubs.opengroup.org/onlinepubs/9699919799.2018edition/functions/mmap.html
     buffer_ = mmap(
         nullptr,                      // optional allocation address.
         non_aligned_size,             // size before page alignment
@@ -2271,7 +2705,6 @@ tml::Process::_launch_pipe_aligned_read_impl(
     DWORD bytes_read = 0;
     const AlignedFlatBuffer buffer(buffer_length);
 
-    // https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-readfile
     while(ReadFile(
         pipe_end,              // Windows file handle (in this case a pipe end)
         buffer.data(),         // Pointer to receive read bytes.
@@ -2321,6 +2754,18 @@ tml::Process::launch() {
     STARTUPINFOW startup_info     = { 0 }; // Startup info: should include relevant flags.
     NativeString arguments;                // Full argument string to be used as CreateProcess' second parameter.
 
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+    // Verify arguments because if anything is empty it's possible UB for the heap copy cancer.
+
+    if([this]() -> bool {
+        for(const auto& arg : arguments_) {
+            if(arg.empty()) return true;
+        }
+        return name_.empty();
+    }()) {
+        SetLastError(ERROR_BAD_ARGUMENTS);
+        throw TMLException::ProcessLaunchException();
+    }
 
     ////////////////////////////////////////////////////////////////////////////////////////////////
     // Remove backslashes from paths, convert name + args into a single string.
@@ -2355,10 +2800,29 @@ tml::Process::launch() {
     ////////////////////////////////////////////////////////////////////////////////////////////////
     // launch the process.
 
+    /*
+     * IMPORTANT:
+     * The second argument of CreateProcessW needs to be a pointer to a null terminated
+     * wide character string. Microsoft's documentation specifies that CreateProcessW WILL
+     * modify the contents of this string. According to cppreference,
+     * "modifying the contents of the string returned from the const overload of std::wstring::c_str()
+     * has undefined behaviour". For this reason we need to use std::wstring to
+     * help with string concatenation, and then copy the string's contents into a new buffer
+     * that we can guarantee it is valid to write to. Quite annoying, but necessary here.
+     */
+
+    auto* tmp_arg_buff = new wchar_t[full_args.size() + 1];
+    tml_defer([tmp_arg_buff] {
+        delete[] tmp_arg_buff;
+    });
+
+    tmp_arg_buff[full_args.size()] = L'\0';
+    memcpy(tmp_arg_buff, full_args.data(), full_args.size());
     startup_info.cb = sizeof(startup_info);
+
     if(!CreateProcessW(
         nullptr,
-        const_cast<NativeChar*>(full_args.data()),
+        tmp_arg_buff,
         nullptr,
         nullptr,
         TRUE,
