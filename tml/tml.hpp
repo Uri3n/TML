@@ -119,15 +119,8 @@ namespace tml {
 }
 
 namespace tml {
-    enum class ForkResult : uint8_t {
-        Error         = 0,
-        InsideParent  = 1,
-        InsideClone   = 2,
-    };
-
     [[noreturn]] auto _panic_impl(const std::string &file, int line, const std::string &msg = "") -> void;
     static auto spawn(const NativeString &name, const std::vector<NativeString> &args = {}, const NativeString &wd = ns("")) -> void;
-    static auto fork()         -> std::pair<Handle, ForkResult>;
     auto last_system_error()   -> std::string;
     auto system_error_exists() -> bool;
 }
@@ -1915,14 +1908,14 @@ tml::OutputDevice::_write_impl(const void *addr, const size_t size) const {
     tml_assert(addr != nullptr);
     if(size == 0)
         throw TMLException(
-            "Attempted to read 0 bytes from an output device.",
-            TMLException::Type::OutputDeviceReadException
+            "Attempted to write 0 bytes to an output device.",
+            TMLException::Type::OutputDeviceWriteException
         );
 
     if(!is_open())
         throw TMLException(
-            "Attempted to read from an invalid output device.",
-            TMLException::Type::OutputDeviceReadException
+            "Attempted to write to an invalid output device.",
+            TMLException::Type::OutputDeviceWriteException
         );
 
     if(!WriteFile(
@@ -2108,8 +2101,21 @@ tml::OutputDevice::create_pipe() {
     return pipe;
 }
 
-template<size_t out_size>
-auto tml::OutputDevice::read_into(FlatBuffer<out_size>& out) -> void {
+inline void
+tml::OutputDevice::_read_impl(void *addr, const size_t size) const {
+    tml_assert(addr != nullptr);
+    if(size == 0)
+        throw TMLException(
+            "Attempted to read 0 bytes from an output device.",
+            TMLException::Type::OutputDeviceReadException
+        );
+
+    if(!is_open())
+        throw TMLException(
+            "Attempted to read from an invalid output device.",
+            TMLException::Type::OutputDeviceReadException
+        );
+
     pollfd fds[1] = { 0 };
     fds[0].fd     = value_;
     fds[0].events = POLLIN;
@@ -2118,8 +2124,36 @@ auto tml::OutputDevice::read_into(FlatBuffer<out_size>& out) -> void {
         throw TMLException::OutputDeviceReadException();
     }
 
-    if(::read(value_, out.data(), out.size()) == -1) {
+    if(::read(value_, addr, size) == -1) {
         throw TMLException::OutputDeviceReadException();
+    }
+}
+
+inline void
+tml::OutputDevice::_write_impl(const void *addr, const size_t size) const {
+    tml_assert(addr != nullptr);
+    if(size == 0)
+        throw TMLException(
+            "Attempted to write 0 bytes to an output device.",
+            TMLException::Type::OutputDeviceWriteException
+        );
+
+    if(!is_open())
+        throw TMLException(
+            "Attempted to write to an invalid output device.",
+            TMLException::Type::OutputDeviceWriteException
+        );
+
+    pollfd fds[1] = { 0 };
+    fds[0].fd     = value_;
+    fds[0].events = POLLOUT;
+
+    if(::poll(fds, 1, -1) == -1 || !(fds[0].revents & POLLOUT)) {
+        throw TMLException::OutputDeviceWriteException();
+    }
+
+    if(::write(value_, addr, size) == -1) {
+        throw TMLException::OutputDeviceWriteException();
     }
 }
 
