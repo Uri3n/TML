@@ -119,16 +119,24 @@ namespace tml {
 }
 
 namespace tml {
-    std::string last_system_error();
-    bool system_error_exists();
-    static void spawn(const NativeString& name, const std::vector<NativeString>& args = {}, const NativeString& wd = ns(""));
-    [[noreturn]] void _panic_impl(const std::string& file, int line, const std::string& msg = "");
+    enum class ForkResult : uint8_t {
+        Error         = 0,
+        InsideParent  = 1,
+        InsideClone   = 2,
+    };
+
+    [[noreturn]] auto _panic_impl(const std::string &file, int line, const std::string &msg = "") -> void;
+    static auto spawn(const NativeString &name, const std::vector<NativeString> &args = {}, const NativeString &wd = ns("")) -> void;
+    static auto fork()         -> std::pair<Handle, ForkResult>;
+    auto last_system_error()   -> std::string;
+    auto system_error_exists() -> bool;
 }
 
 namespace tml::this_process {
+    bool redirect_out(OutputDevice&& new_out);
     [[nodiscard]] Handle get();
-    [[nodiscard]] OutputDevice out();
-    [[nodiscard]] OutputDevice err();
+    [[nodiscard]] OutputDevice outs();
+    [[nodiscard]] OutputDevice errs();
     [[nodiscard]] size_t get_id();
     [[noreturn]]  void kill(int status = 0);
 }
@@ -266,32 +274,54 @@ public:
         None,       // Invalid
         File,       // Output device is a file on disk.
         PipeEnd,    // anonymous pipe. read or write end not specified.
-        NamedPipe,  // bidirectional named pipe.
     };
 
-    template<size_t out_size = 1024> FlatBuffer<out_size> read();
-    template<size_t out_size = 1024> void read_into(FlatBuffer<out_size>& out);
+    template<size_t out_size>
+    void read_into(FlatBuffer<out_size>& out) const;
+    void read_into(std::vector<uint8_t>& out) const;
+    void read_into(NativeString& out)         const;
+
+    template<size_t in_size>
+    void write_from(const FlatBuffer<in_size>& in)  const;
+    void write_from(const std::vector<uint8_t>& in) const;
+    void write_from(const NativeString& in)         const;
+
+    template<size_t out_size>
+    OutputDevice& operator>>(FlatBuffer<out_size>&);
+    OutputDevice& operator>>(std::vector<uint8_t>&);
+    OutputDevice& operator>>(NativeString&);
+
+    template<size_t in_size>
+    OutputDevice& operator<<(const FlatBuffer<in_size>&);
+    OutputDevice& operator<<(const std::vector<uint8_t>&);
+    OutputDevice& operator<<(const NativeString&);
+
+    bool operator==(const OutputDevice&) const noexcept;
+    bool operator==(OutputDevice::Value) const noexcept;
+    bool operator!=(const OutputDevice&) const noexcept;
+    bool operator!=(OutputDevice::Value) const noexcept;
 
     void close();
     void invalidate();
-    [[nodiscard]] Value value() const;
+    [[nodiscard]] Value value()   const;
+    [[nodiscard]] Type  type()    const;
+    [[nodiscard]] bool  is_open() const;
 
     static auto get_invalid_handle_state()                         -> Value;
     static auto is_invalid_handle_state(Value value)               -> bool;
     static auto open_file(const NativeString& name, bool append)   -> OutputDevice;
+    static auto create_temp_file(const NativeString& name, bool append) -> OutputDevice;
     static auto create_file(const NativeString& name, bool append) -> OutputDevice;
     static auto create_pipe()                                      -> AnonymousPipe;
-
-    bool operator==(const OutputDevice& other) const noexcept;
-    bool operator==(OutputDevice::Value other) const noexcept;
-    bool operator!=(const OutputDevice& other) const noexcept;
-    bool operator!=(OutputDevice::Value other) const noexcept;
 
     ~OutputDevice() = default;
     OutputDevice() : value_(get_invalid_handle_state()) {}
     OutputDevice(const Value value) : value_(value) {}
 
 private:
+    void _read_impl(void* addr, size_t size) const;
+    void _write_impl(const void* addr, size_t size) const;
+
     Value value_{};
     Type  type_ = Type::None;
 };
@@ -530,6 +560,7 @@ private:
     TML_X(ProcessTerminationException)   \
     TML_X(ProcessLaunchException)        \
     TML_X(OutputDeviceReadException)     \
+    TML_X(OutputDeviceWriteException)    \
     TML_X(OutputDeviceCreationException) \
     TML_X(OutputDeviceCloseException)    \
     TML_X(FileSystemException)           \
@@ -672,12 +703,12 @@ tml::this_process::kill(const int status) {
 }
 
 [[nodiscard]] inline tml::OutputDevice
-tml::this_process::out() {
+tml::this_process::outs() {
     return GetStdHandle(STD_OUTPUT_HANDLE);
 }
 
 [[nodiscard]] inline tml::OutputDevice
-tml::this_process::err() {
+tml::this_process::errs() {
     return GetStdHandle(STD_ERROR_HANDLE);
 }
 
@@ -689,6 +720,15 @@ tml::this_process::get_id() {
 TML_ATTR_FORCEINLINE tml::Handle
 tml::this_process::get() {
     return Handle(GetCurrentProcess());
+}
+
+inline bool
+tml::this_process::redirect_out(OutputDevice&& new_out) {
+    HANDLE hnew_out = new_out.value();
+    new_out.close();
+    new_out.invalidate();
+
+    return SetStdHandle(STD_OUTPUT_HANDLE, hnew_out) != 0;
 }
 
 TML_ATTR_FORCEINLINE bool
@@ -726,6 +766,8 @@ tml::last_system_error() {
     LocalFree(outbuf);
     return out;
 }
+
+
 
 static void
 tml::spawn(const NativeString& name, const std::vector<NativeString>& args, const NativeString& wd) {
@@ -799,12 +841,12 @@ tml::this_process::kill(const int status) {
 }
 
 [[nodiscard]] inline tml::OutputDevice
-tml::this_process::out() {
+tml::this_process::outs() {
     return {STDOUT_FILENO};
 }
 
 [[nodiscard]] inline tml::OutputDevice
-tml::this_process::err() {
+tml::this_process::errs() {
     return {STDERR_FILENO};
 }
 
@@ -821,6 +863,16 @@ tml::this_process::get() {
 TML_ATTR_FORCEINLINE bool
 tml::system_error_exists() {
     return errno != 0;
+}
+
+inline bool
+tml::this_process::redirect_out(OutputDevice&& new_out) {
+    //const int dup_stdout = dup2(hredirect, STDOUT_FILENO);
+    const int hnew_out = new_out.value();
+    new_out.close();
+    new_out.invalidate();
+
+    return dup2(hnew_out, STDOUT_FILENO) != -1 && dup2(hnew_out, STDERR_FILENO) != -1;
 }
 
 inline std::string
@@ -1732,41 +1784,125 @@ tml::OutputDevice::operator==(const OutputDevice::Value other) const noexcept {
     return this->value_ == other;
 }
 
+template<size_t in_size>
+auto tml::OutputDevice::operator<<(const FlatBuffer<in_size> &in) -> OutputDevice& {
+    write_from(in);
+    return *this;
+}
+
+inline tml::OutputDevice&
+tml::OutputDevice::operator<<(const std::vector<uint8_t>& in) {
+    write_from(in);
+    return *this;
+}
+
+inline tml::OutputDevice&
+tml::OutputDevice::operator<<(const NativeString &in) {
+    write_from(in);
+    return *this;
+}
+
+template<size_t out_size>
+auto tml::OutputDevice::operator>>(FlatBuffer<out_size>& out) -> OutputDevice& {
+    read_into(out);
+    return *this;
+}
+
+inline tml::OutputDevice&
+tml::OutputDevice::operator>>(std::vector<uint8_t>& out) {
+    read_into(out);
+    return *this;
+}
+
+inline tml::OutputDevice&
+tml::OutputDevice::operator>>(NativeString &out) {
+    read_into(out);
+    return *this;
+}
+
+template<size_t out_size>
+auto tml::OutputDevice::read_into(FlatBuffer<out_size> &out) const -> void {
+    _read_impl(out.data(), out.size());
+}
+
+inline void
+tml::OutputDevice::read_into(std::vector<uint8_t>& out) const {
+    _read_impl(out.data(), out.size());
+}
+
+inline void
+tml::OutputDevice::read_into(NativeString& out) const {
+    _read_impl(out.data(), out.size());
+}
+
+template<size_t in_size>
+void tml::OutputDevice::write_from(const FlatBuffer<in_size>& in) const {
+    _write_impl(in.data(), in.size());
+}
+
+inline void
+tml::OutputDevice::write_from(const std::vector<uint8_t>& in) const {
+    _write_impl(in.data(), in.size());
+}
+
+inline void
+tml::OutputDevice::write_from(const NativeString& in) const {
+    _write_impl(in.data(), in.size());
+}
+
 inline void
 tml::OutputDevice::invalidate() {
     value_ = get_invalid_handle_state();
     type_  = Type::None;
 }
 
-[[nodiscard]] inline tml::OutputDevice::Value
-tml::OutputDevice::value() const {
+[[nodiscard]] inline
+auto tml::OutputDevice::value() const -> Value {
     return value_;
 }
 
-#if defined(TML_WINDOWS)
-
-template<size_t out_size>
-auto tml::OutputDevice::read() -> tml::FlatBuffer<out_size> {
-    FlatBuffer<out_size> buffer;
-    if(!ReadFile(
-        value_,          // file handle.
-        buffer.data(),   // pointer to receive bytes.
-        buffer.size(),   // # of bytes to read
-        nullptr,         // out parameter for bytes read. Optional.
-        nullptr          // ptr to OVERLAPPED structure for async io. Optional.
-    )) {
-        throw TMLException::OutputDeviceReadException();
-    }
-
-    return buffer;
+[[nodiscard]] inline
+auto tml::OutputDevice::type() const -> Type {
+    return type_;
 }
 
-template<size_t out_size>
-auto tml::OutputDevice::read_into(FlatBuffer<out_size> &out) -> void {
+[[nodiscard]] inline
+auto tml::OutputDevice::is_open() const -> bool {
+    return !is_invalid_handle_state(value_);
+}
+
+
+#if defined(TML_WINDOWS)
+
+TML_ATTR_FORCEINLINE tml::OutputDevice::Value
+tml::OutputDevice::get_invalid_handle_state() {
+    return nullptr;
+}
+
+TML_ATTR_FORCEINLINE bool
+tml::OutputDevice::is_invalid_handle_state(const Value value) {
+    return value == nullptr || value == INVALID_HANDLE_VALUE;
+}
+
+inline void
+tml::OutputDevice::_read_impl(void* addr, const size_t size) const {
+    tml_assert(addr != nullptr);
+    if(size == 0)
+        throw TMLException(
+            "Attempted to read 0 bytes from an output device.",
+            TMLException::Type::OutputDeviceReadException
+        );
+
+    if(!is_open())
+        throw TMLException(
+            "Attempted to read from an invalid output device.",
+            TMLException::Type::OutputDeviceReadException
+        );
+
     if(!ReadFile(
         value_,
-        out.data(),
-        out.size(),
+        addr,
+        size,
         nullptr,
         nullptr
     )) {
@@ -1774,9 +1910,30 @@ auto tml::OutputDevice::read_into(FlatBuffer<out_size> &out) -> void {
     }
 }
 
-TML_ATTR_FORCEINLINE tml::OutputDevice::Value
-tml::OutputDevice::get_invalid_handle_state() {
-    return nullptr;
+inline void
+tml::OutputDevice::_write_impl(const void *addr, const size_t size) const {
+    tml_assert(addr != nullptr);
+    if(size == 0)
+        throw TMLException(
+            "Attempted to read 0 bytes from an output device.",
+            TMLException::Type::OutputDeviceReadException
+        );
+
+    if(!is_open())
+        throw TMLException(
+            "Attempted to read from an invalid output device.",
+            TMLException::Type::OutputDeviceReadException
+        );
+
+    if(!WriteFile(
+        value_,
+        addr,
+        size,
+        nullptr,
+        nullptr
+    )) {
+        throw TMLException::OutputDeviceWriteException();
+    }
 }
 
 inline void
@@ -1787,11 +1944,6 @@ tml::OutputDevice::close() {
     }
 
     value_ = get_invalid_handle_state();
-}
-
-TML_ATTR_FORCEINLINE bool
-tml::OutputDevice::is_invalid_handle_state(const Value value) {
-    return value == nullptr || value == INVALID_HANDLE_VALUE;
 }
 
 inline tml::OutputDevice
@@ -1826,6 +1978,14 @@ tml::OutputDevice::create_file(const NativeString& name, const bool append) {
     }
 
     return device;
+}
+
+inline tml::OutputDevice
+tml::OutputDevice::create_temp_file(const NativeString& name, const bool append) {
+    auto tmp_dir = std::filesystem::temp_directory_path().wstring();
+    if(tmp_dir.back() != L'\\') tmp_dir += L'\\';
+    tmp_dir += name;
+    return create_file(tmp_dir, append);
 }
 
 inline auto
@@ -1908,6 +2068,14 @@ tml::OutputDevice::create_file(const NativeString& name, const bool append) {
     return device;
 }
 
+inline tml::OutputDevice
+tml::OutputDevice::create_temp_file(const NativeString& name, const bool append) {
+    auto tmp_dir = std::filesystem::temp_directory_path().string();
+    if(tmp_dir.back() != '/') tmp_dir += '/';
+    tmp_dir += name;
+    return create_file(tmp_dir, append);
+}
+
 inline auto
 tml::OutputDevice::open_file(const NativeString &name, const bool append) -> OutputDevice {
     OutputDevice device;
@@ -1938,25 +2106,6 @@ tml::OutputDevice::create_pipe() {
     pipe.read_end.type_   = Type::PipeEnd;
     pipe.write_end.type_  = Type::PipeEnd;
     return pipe;
-}
-
-template<size_t out_size>
-auto tml::OutputDevice::read() -> FlatBuffer<out_size> {
-    auto   out    = FlatBuffer<out_size>();
-    pollfd fds[1] = { 0 };
-    fds[0].fd     = value_;
-    fds[0].events = POLLIN;
-
-    std::fill(out.begin(), out.end(), '\0');
-    if(::poll(fds, 1, -1) == -1 || !(fds[0].revents & POLLIN)) {
-        throw TMLException::OutputDeviceReadException();
-    }
-
-    if(::read(value_, out.data(), out.size()) == -1) {
-        throw TMLException::OutputDeviceReadException();
-    }
-
-    return out;
 }
 
 template<size_t out_size>
@@ -2971,7 +3120,6 @@ tml::Process::on_exit(OnExitCallback callback) {
     exit_callback_ = callback;
     return *this;
 }
-
 
 #if defined(TML_WINDOWS)
 
