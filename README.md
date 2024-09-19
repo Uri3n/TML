@@ -1,2 +1,2 @@
 # TML
-C++ doesn't have any good libraries for multiprocessing. Time to fix that (WIP).
+A tiny, lightweight, cross-platform, single header C++ library for multiprocessing and interprocess communication.
