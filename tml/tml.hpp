@@ -44,11 +44,11 @@
         #define TML_COMPILEDWITH_GCC
     #endif
     #define TML_ATTR_NOINLINE    __attribute__((noinline))
-    #define TML_ATTR_FORCEINLINE __attribute__((always_inline))
+    #define TML_ATTR_FORCEINLINE __attribute__((always_inline)) inline
 #elif defined(_MSC_VER)
     #define TML_COMPILEDWITH_MSVC
     #define TML_ATTR_NOINLINE    __declspec(noinline)
-    #define TML_ATTR_FORCEINLINE __forceinline
+    #define TML_ATTR_FORCEINLINE __forceinline inline
 #else
     #define TML_COMPILEDWITH_UNKNOWN
     #define TML_ATTR_NOINLINE
