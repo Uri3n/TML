@@ -136,7 +136,7 @@ namespace tml::this_process {
 
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-// ~ tml::DeferredAction ~
+// ~ tml::ScopedAction ~
 // - A very basic RAII wrapper around an invocable object.
 // - Calls the invocable object when the destructor is invoked.
 // - Comes with two macros, tml_defer, and tml_defer_if to make using the class cleaner.
