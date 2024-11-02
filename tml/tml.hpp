@@ -1,4 +1,3 @@
-
 #ifndef TML_HPP
 #define TML_HPP
 
@@ -23,7 +22,7 @@
 
 #if defined(TML_WINDOWS)
     #include <Windows.h>
-    #define ns(STR) (L##STR)
+    #define tml_ns(STR) (L##STR)
 #else // POSIX
     #include <unistd.h>
     #include <csignal>
@@ -64,6 +63,7 @@
 #include <utility>
 #include <variant>
 #include <algorithm>
+#include <vector>
 #include <array>
 #include <chrono>
 
@@ -120,7 +120,7 @@ namespace tml {
 
 namespace tml {
     [[noreturn]] auto _panic_impl(const std::string &file, int line, const std::string &msg = "") -> void;
-    static auto spawn(const NativeString &name, const std::vector<NativeString> &args = {}, const NativeString &wd = ns("")) -> void;
+    static auto spawn(const NativeString &name, const std::vector<NativeString> &args = {}, const NativeString &wd = tml_ns("")) -> void;
     auto last_system_error()   -> std::string;
     auto system_error_exists() -> bool;
 }
@@ -761,7 +761,6 @@ tml::last_system_error() {
 }
 
 
-
 static void
 tml::spawn(const NativeString& name, const std::vector<NativeString>& args, const NativeString& wd) {
 
@@ -780,9 +779,10 @@ tml::spawn(const NativeString& name, const std::vector<NativeString>& args, cons
     const auto full = [&]() -> NativeString {
         NativeString full_ = name;
         for(const auto& arg : args) {
-            full_ += ' ';
+            full_ += L' ';
             full_ += arg;
         }
+        return full_;
     }();
 
     //
@@ -790,12 +790,12 @@ tml::spawn(const NativeString& name, const std::vector<NativeString>& args, cons
     // tml::Process::launch() to see why we need to do this.
     //
 
-    auto* tmp_arg_buff = new wchar_t[full.size() + 1];
+    auto* tmp_arg_buff = new wchar_t[(full.size() + 1) * sizeof(wchar_t)];
     tml_defer([tmp_arg_buff] {
         delete[] tmp_arg_buff;
     });
 
-    memcpy(tmp_arg_buff, full.data(), full.size());
+    memcpy(tmp_arg_buff, full.data(), full.size() * sizeof(wchar_t));
     tmp_arg_buff[full.size()] = L'\0';
 
     //
@@ -3307,16 +3307,17 @@ tml::Process::launch() {
      * has undefined behaviour". For this reason we need to use std::wstring to
      * help with string concatenation, and then copy the string's contents into a new buffer
      * that we can guarantee it is valid to write to. Quite annoying, but necessary here.
+     * - Masq
      */
 
-    auto* tmp_arg_buff = new wchar_t[full_args.size() + 1];
+    auto* tmp_arg_buff = new wchar_t[(full_args.size() + 1) * sizeof(wchar_t)];
     tml_defer([tmp_arg_buff] {
         delete[] tmp_arg_buff;
     });
 
     tmp_arg_buff[full_args.size()] = L'\0';
-    memcpy(tmp_arg_buff, full_args.data(), full_args.size());
-    startup_info.cb = sizeof(startup_info);
+    memcpy(tmp_arg_buff, full_args.data(), full_args.size() * sizeof(wchar_t));
+    startup_info.cb = sizeof(STARTUPINFOW);
 
     if(!CreateProcessW(
         nullptr,
@@ -3326,7 +3327,7 @@ tml::Process::launch() {
         TRUE,
         0,
         nullptr,
-        working_directory_.c_str(),
+        working_directory_.empty() ? nullptr : working_directory_.c_str(),
         &startup_info,
         &proc_info
     )) {
@@ -3354,7 +3355,7 @@ tml::Process::launch() {
     else if(palignedcb) { // aligned buffer cb.
         output_callback_worker_ = std::make_unique<std::thread>(
             _launch_pipe_aligned_read_impl,
-            pfile->value(),
+            ppipe->read_end.value(),
             *palignedcb,
             callback_buffer_hint_
         );
