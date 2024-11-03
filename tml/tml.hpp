@@ -22,7 +22,7 @@
 
 #if defined(TML_WINDOWS)
     #include <Windows.h>
-    #define tml_ns(STR) (L##STR)
+    #define nstr(STR) (L##STR)
 #else // POSIX
     #include <unistd.h>
     #include <csignal>
@@ -33,7 +33,7 @@
     #include <fcntl.h>
     #include <poll.h>
     #include <semaphore.h>
-    #define ns(STR) ((const char*)u8##STR)
+    #define nstr(STR) ((const char*)u8##STR)
 #endif
 
 #if defined(__clang__) || defined(__GNUC__)
@@ -120,7 +120,7 @@ namespace tml {
 
 namespace tml {
     [[noreturn]] auto _panic_impl(const std::string &file, int line, const std::string &msg = "") -> void;
-    static auto spawn(const NativeString &name, const std::vector<NativeString> &args = {}, const NativeString &wd = tml_ns("")) -> void;
+    static auto spawn(const NativeString &name, const std::vector<NativeString> &args = {}, const NativeString &wd = nstr("")) -> void;
     auto last_system_error()   -> std::string;
     auto system_error_exists() -> bool;
 }
@@ -145,13 +145,12 @@ template<typename T> requires std::is_invocable_v<T>
 class tml::ScopedAction {
     T action_;
 public:
-    ~ScopedAction() { action_(); }
-
     ScopedAction(const ScopedAction&)             = delete;
     ScopedAction& operator=(const ScopedAction&)  = delete;
     ScopedAction(const ScopedAction&&)            = delete;
     ScopedAction& operator=(const ScopedAction&&) = delete;
 
+    ~ScopedAction() { action_(); }
     explicit ScopedAction(const T action) : action_(action) {}
 };
 
@@ -480,9 +479,9 @@ public:
     LockGuard& operator=(const LockGuard&&) = delete;
 
     [[nodiscard]] bool has_lock() const;
-    ~LockGuard()                 noexcept;
-    explicit LockGuard(T&, bool) noexcept;
-    explicit LockGuard(T&)       noexcept;
+    ~LockGuard() noexcept;
+    explicit LockGuard(T&, bool try_lock) noexcept;
+    explicit LockGuard(T&) noexcept;
 private:
     T& lock_;
     bool locked_ = false;
@@ -601,7 +600,7 @@ public:
     Process& args(const std::vector<NativeString>& arg_list);
     Process& args(std::vector<NativeString>&& arg_list);
     Process& working_directory(const NativeString& dir);
-    Process& file_redirect(const NativeString& file_name, bool append_contents);
+    Process& file_redirect(const NativeString& file_name, bool append_contents = true);
     Process& on_exit(OnExitCallback callback);
     Process& launch();
     ExitCode wait();
@@ -741,8 +740,8 @@ tml::last_system_error() {
 
     result = FormatMessageA(
         FORMAT_MESSAGE_ALLOCATE_BUFFER              // Specifies that a buffer should be allocated for the message.
-            | FORMAT_MESSAGE_FROM_SYSTEM            // Indicates that the system message table should be searched.
-            | FORMAT_MESSAGE_IGNORE_INSERTS,        // Indicates that insert sequences (i.e. "%1") should be ignored.
+          | FORMAT_MESSAGE_FROM_SYSTEM              // Indicates that the system message table should be searched.
+          | FORMAT_MESSAGE_IGNORE_INSERTS,          // Indicates that insert sequences (i.e. "%1") should be ignored.
         nullptr,                                    // Optional, pointer to the message definition
         err_code,                                   // The error code to be formatted.
         MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),  // Default language
@@ -763,7 +762,6 @@ tml::last_system_error() {
 
 static void
 tml::spawn(const NativeString& name, const std::vector<NativeString>& args, const NativeString& wd) {
-
     //
     // if "name" or any string in "args" is empty,
     // we should reject this call right away.
@@ -790,7 +788,7 @@ tml::spawn(const NativeString& name, const std::vector<NativeString>& args, cons
     // tml::Process::launch() to see why we need to do this.
     //
 
-    auto* tmp_arg_buff = new wchar_t[(full.size() + 1) * sizeof(wchar_t)];
+    auto* tmp_arg_buff = new wchar_t[full.size() + 1];
     tml_defer([tmp_arg_buff] {
         delete[] tmp_arg_buff;
     });
@@ -1947,17 +1945,22 @@ tml::OutputDevice::create_file(const NativeString& name, const bool append) {
         flags |= FILE_APPEND_DATA;
     }
 
+    SECURITY_ATTRIBUTES sa  = { 0 };
+    sa.nLength              = sizeof(sa);
+    sa.lpSecurityDescriptor = nullptr;
+    sa.bInheritHandle       = TRUE;
+
     device.type_  = Type::File;
     device.value_ = CreateFileW(
-        name.c_str(),                        // Name of the file.
-        flags,                               // Access flags.
-        FILE_SHARE_READ                      // Other processes can read from this file at the same time.
-          | FILE_SHARE_WRITE                 // Other processes can write to this file at the same time.
-          | FILE_SHARE_DELETE,               // Other processes can delete this file while it's open here.
-        nullptr,                             // Security attributes for a descriptor. Optional.
-        OPEN_ALWAYS,                         // Open mode.
-        FILE_ATTRIBUTE_NORMAL,               // File attributes. File is normal.
-        nullptr                              // Optional handle to a template file.
+        name.c_str(),            // Name of the file.
+        flags,                   // Access flags.
+        FILE_SHARE_READ          // Other processes can read from this file at the same time.
+          | FILE_SHARE_WRITE     // Other processes can write to this file at the same time.
+          | FILE_SHARE_DELETE,   // Other processes can delete this file while it's open here.
+        &sa,                     // Security attributes for the descriptor. Optional.
+        OPEN_ALWAYS,             // Open mode.
+        FILE_ATTRIBUTE_NORMAL,   // File attributes. File is normal.
+        nullptr                  // Optional handle to a template file.
     );
 
     if(device.value_ == INVALID_HANDLE_VALUE) {
@@ -2017,7 +2020,12 @@ tml::OutputDevice::create_pipe() {
     pipe.read_end.type_   = Type::PipeEnd;
     pipe.write_end.type_  = Type::PipeEnd;
 
-    if(!CreatePipe(&pipe.read_end.value_, &pipe.write_end.value_, nullptr, 0)) {
+    SECURITY_ATTRIBUTES sa  = { 0 };
+    sa.nLength              = sizeof(sa);
+    sa.lpSecurityDescriptor = nullptr;
+    sa.bInheritHandle       = TRUE;
+
+    if(!CreatePipe(&pipe.read_end.value_, &pipe.write_end.value_, &sa, 0)) {
         throw TMLException::OutputDeviceCreationException();
     }
     return pipe;
@@ -2213,8 +2221,7 @@ tml::LockGuard<T>::LockGuard(T& lock, const bool try_lock) noexcept : lock_(lock
     } else {
         res = lock_.lock();
     }
-
-    locked_ = res == Lock::Result::Acquired;
+    locked_ = (res == Lock::Result::Acquired);
 }
 
 template<tml::Lockable T>
@@ -2239,7 +2246,7 @@ auto tml::NamedSemaphore<num_slots>::name() -> const NativeString& {
 
 template<size_t num_slots>
 bool tml::NamedSemaphore<num_slots>::is_valid() {
-    return Lock::is_invalid_handle_state(value_);
+    return !Lock::is_invalid_handle_state(value_);
 }
 
 #if defined(TML_WINDOWS)
@@ -2333,6 +2340,10 @@ auto tml::NamedSemaphore<num_slots>::open(const NativeString &name) -> NamedSema
         FALSE,                    // Do not inherit this handle in child processes.
         sem.name_.c_str()         // Semaphore name (with "Local\" prefix)
     );
+
+    if(Lock::is_invalid_handle_state(sem.value_) && GetLastError() == ERROR_SUCCESS) {
+        SetLastError(ERROR_NOT_FOUND);
+    }
     return sem;
 }
 
@@ -2515,13 +2526,13 @@ TML_ATTR_FORCEINLINE void
 tml::NamedMutex::close() {
     if(!Lock::is_invalid_handle_state(value_)) {
         CloseHandle(value_);
-        value_ = get_invalid_handle_state();
+        value_ = Lock::get_invalid_handle_state();
     }
 }
 
 TML_ATTR_FORCEINLINE bool
 tml::NamedMutex::is_valid() {
-    return Lock::is_invalid_handle_state(value_);
+    return !Lock::is_invalid_handle_state(value_);
 }
 
 TML_ATTR_FORCEINLINE void
@@ -2556,6 +2567,10 @@ tml::NamedMutex::open(const NativeString &name) {
         FALSE,                // Child processes do not inherit this mutex handle.
         full.c_str()          // Full name of the mutex.
     );
+
+    if(Lock::is_invalid_handle_state(mtx.value_)) {
+        SetLastError(ERROR_NOT_FOUND);
+    }
     return mtx;
 }
 
@@ -2659,8 +2674,8 @@ tml::SharedRegion::_create_impl(
     ////////////////////////////////////////////////////////////////////////////////////////////////
     // Create shared memory object.
 
-    sr.name_   = full;
-    sr.size_   = length;
+    sr.name_ = full;
+    sr.size_ = length == 0 ? max_length : length;
     sr.handle_ = CreateFileMappingW(
         INVALID_HANDLE_VALUE,                                   // Indicates that we are creating this object from the pagefile.
         nullptr,                                                // attributes. Optional.
@@ -2707,7 +2722,7 @@ tml::SharedRegion::open(const NativeString &name, const size_t length) {
     sr.handle_ = OpenFileMappingW(
         FILE_MAP_ALL_ACCESS,        // Why do we need to specify this? MapViewOfFile already requires this...
         FALSE,                      // Do not inherit this handle in child processes.
-        full.c_str()                // Object name, prefixed with Local\.
+        full.c_str()                // Object name, prefixed with "Local\".
     );
 
     if(sr.handle_ == nullptr) {
@@ -3202,6 +3217,7 @@ tml::Process::_launch_pipe_aligned_read_impl(
 
     DWORD bytes_read = 0;
     const AlignedFlatBuffer buffer(buffer_length);
+    memset(buffer.data(), 0, buffer.size());
 
     while(ReadFile(
         pipe_end,              // Windows file handle (in this case a pipe end)
@@ -3211,7 +3227,7 @@ tml::Process::_launch_pipe_aligned_read_impl(
         nullptr                // Optional pointer to an OVERLAPPED structure for async IO.
     ) && bytes_read > 0) {     // I think this makes sense?
         cb(buffer);
-        memset(buffer.data(), static_cast<uint8_t>(0), buffer.size());
+        memset(buffer.data(), 0, buffer.size());
     }
 }
 
@@ -3227,6 +3243,8 @@ tml::Process::_launch_pipe_dyn_read_impl(
 
     DWORD bytes_read = 0;
     std::vector<uint8_t> buffer(buffer_length);
+    std::ranges::fill(buffer, static_cast<uint8_t>('\0'));
+
     while(ReadFile(
         pipe_end,
         buffer.data(),
@@ -3307,10 +3325,9 @@ tml::Process::launch() {
      * has undefined behaviour". For this reason we need to use std::wstring to
      * help with string concatenation, and then copy the string's contents into a new buffer
      * that we can guarantee it is valid to write to. Quite annoying, but necessary here.
-     * - Masq
      */
 
-    auto* tmp_arg_buff = new wchar_t[(full_args.size() + 1) * sizeof(wchar_t)];
+    auto* tmp_arg_buff = new wchar_t[full_args.size() + 1];
     tml_defer([tmp_arg_buff] {
         delete[] tmp_arg_buff;
     });
