@@ -94,7 +94,7 @@ and `std::semaphore`, with the main difference being that these are openable and
 Additionally, you can use `tml::LockGuard` as an RAII mechanism to automatically unlock these lockable types once they
 leave scope (similar to `std::lock_guard`). These types are created with their respective `create()` and `create_or_open()` functions, and can be "opened" by other processes by calling `open()`. 
 
-both `lock()` and `try_lock()` return an enum that specifies whether the lock was acquired or not, and whether
+both `lock()` and `try_lock()` return an enum value that specifies whether the lock was acquired or not, and whether
 the process was blocked from acquiring the lock because there aren't any slots left to acquire.
 
 The process that creates the semaphore or mutex will need to call `destroy()` on it. Any other process that opens
@@ -105,7 +105,7 @@ a reference to it needs to call `close()` instead. This is demonstrated in the c
 // that there are 2 semaphore slots.
 auto sem = NamedSemaphore<2>::create_or_open(nstr("My_Semaphore"));
 if(!sem.is_valid()) {
-  std::cerr << "couldn't create the mutex.\n";
+  std::cerr << "couldn't create the semaphore.\n";
   return 1;
 }
 
