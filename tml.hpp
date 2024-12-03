@@ -67,9 +67,6 @@
 #include <array>
 #include <chrono>
 
-static_assert(sizeof(size_t) == 8,   "Only modern 64-bit architectures are allowed.");
-static_assert(sizeof(unsigned) == 4, "Only modern 64-bit architectures are allowed.");
-
 namespace tml {
     class Process;
     class OutputDevice;
