@@ -21,7 +21,7 @@
 #endif
 
 #if defined(TML_WINDOWS)
-    #include <Windows.h>
+    #include <windows.h>
     #define nstr(STR) (L##STR)
 #else // POSIX
     #include <unistd.h>
